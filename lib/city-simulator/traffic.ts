@@ -21,6 +21,8 @@ export interface Vehicle {
   conf: number // detection confidence (random-walked for a live feel)
   trail: [number, number][]
   trailClock: number
+  dwell: number // seconds remaining stopped at a bus stop
+  servedStop: number // edge id of the last bus stop served (-1 = none)
 }
 
 const KIND_SPECS: Record<VehicleKind, { len: number; width: number; vmax: number; colors: string[] }> = {
@@ -102,6 +104,8 @@ export class TrafficSim {
       conf: 0.7 + this.rng() * 0.28,
       trail: [],
       trailClock: 0,
+      dwell: 0,
+      servedStop: -1,
     }
   }
 
@@ -125,6 +129,27 @@ export class TrafficSim {
         const edge = this.city.edges[v.edgeId]
         const vmax = Math.min(KIND_SPECS[v.kind].vmax, edge.speedLimit)
         let target = vmax
+
+        // Buses dwell at bus stops
+        if (v.kind === "bus") {
+          if (v.dwell > 0) {
+            v.dwell -= dt
+            v.speed = 0
+            continue
+          }
+          const stopS = this.city.busStops.get(v.edgeId)
+          if (stopS !== undefined && v.servedStop !== v.edgeId && v.s <= stopS) {
+            const dist = stopS - v.s
+            const brake = (v.speed * v.speed) / (2 * 4.5) + 2
+            if (dist < brake + 12) target = Math.min(target, Math.max(0, (dist / brake) * vmax))
+            if (dist < 1 && v.speed < 0.6) {
+              v.dwell = 3 + this.rng() * 3
+              v.servedStop = v.edgeId
+              v.speed = 0
+              continue
+            }
+          }
+        }
 
         // Follow the leader on the same lane
         const leader = idx + 1 < arr.length ? arr[idx + 1] : null
@@ -221,7 +246,7 @@ export class TrafficSim {
       const c = (dx: number, dy: number) => this.city.toLngLat(p.x + p.hx * dx + px * dy, p.y + p.hy * dx + py * dy)
       features.push({
         type: "Feature",
-        properties: { kind: v.kind, color: v.color },
+        properties: { id: v.id, kind: v.kind, color: v.color },
         geometry: { type: "Polygon", coordinates: [[c(hl, hw), c(hl, -hw), c(-hl, -hw), c(-hl, hw), c(hl, hw)]] },
       })
     }
@@ -320,5 +345,148 @@ export class TrafficSim {
     const counts: Record<VehicleKind, number> = { car: 0, taxi: 0, bus: 0, truck: 0 }
     for (const v of this.vehicles) counts[v.kind]++
     return counts
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Pedestrians: walk the sidewalks along the road graph, wait at signalized
+// corners until cross-traffic has the red, then continue.
+
+export interface Pedestrian {
+  id: number
+  edgeId: number
+  s: number
+  side: 1 | -1 // which sidewalk relative to the direction of travel
+  speed: number
+  waiting: boolean
+  pendingEdge: number // edge to enter once the crossing is safe
+  conf: number
+  color: string
+}
+
+const PED_COLORS = ["#f9a8d4", "#fcd34d", "#a5b4fc", "#86efac", "#fdba74", "#e2e8f0"]
+const PED_BOX_COLOR = "#f472b6"
+
+export class PedestrianSim {
+  peds: Pedestrian[] = []
+  private rng: () => number
+  private nextId = 1
+
+  constructor(private sim: TrafficSim, seed = 7) {
+    this.rng = mulberry32(seed)
+  }
+
+  setCount(n: number) {
+    while (this.peds.length > n) this.peds.pop()
+    const edges = this.sim.city.edges
+    while (this.peds.length < n) {
+      const edge = edges[Math.floor(this.rng() * edges.length)]
+      this.peds.push({
+        id: this.nextId++,
+        edgeId: edge.id,
+        s: this.rng() * edge.length,
+        side: this.rng() < 0.5 ? 1 : -1,
+        speed: 1.1 + this.rng() * 0.7,
+        waiting: false,
+        pendingEdge: -1,
+        conf: 0.6 + this.rng() * 0.35,
+        color: PED_COLORS[Math.floor(this.rng() * PED_COLORS.length)],
+      })
+    }
+  }
+
+  step(dt: number) {
+    const city = this.sim.city
+    for (const p of this.peds) {
+      p.conf = Math.min(0.99, Math.max(0.45, p.conf + (this.rng() - 0.5) * 0.05))
+      const edge = city.edges[p.edgeId]
+      if (p.waiting) {
+        // Crossing the perpendicular street: safe once its traffic has the red
+        const crossAxis = edge.axis === "h" ? "v" : "h"
+        if (this.sim.lightState(edge.to, crossAxis) === "r") {
+          p.edgeId = p.pendingEdge
+          p.s = 0
+          p.waiting = false
+        }
+        continue
+      }
+      p.s += p.speed * dt
+      if (p.s < edge.length) continue
+
+      // Reached the corner: pick where to go next
+      const next = this.chooseNext(edge)
+      const node = city.nodes[edge.to]
+      const goesStraight = next.axis === edge.axis && next.sign === edge.sign
+      if (node.hasLight && goesStraight) {
+        const crossAxis = edge.axis === "h" ? "v" : "h"
+        if (this.sim.lightState(edge.to, crossAxis) !== "r") {
+          p.s = edge.length
+          p.waiting = true
+          p.pendingEdge = next.id
+          continue
+        }
+      }
+      p.s -= edge.length
+      p.edgeId = next.id
+    }
+  }
+
+  private chooseNext(edge: RoadEdge): RoadEdge {
+    const city = this.sim.city
+    const reverse = city.reverseEdge[edge.id]
+    const options = city.outgoing[edge.to].filter((id) => id !== reverse)
+    if (!options.length) return city.edges[reverse]
+    return city.edges[options[Math.floor(this.rng() * options.length)]]
+  }
+
+  position(p: Pedestrian): { x: number; y: number; hx: number; hy: number; lngLat: [number, number] } {
+    const city = this.sim.city
+    const edge = city.edges[p.edgeId]
+    const a = city.nodePos(edge.from)
+    const b = city.nodePos(edge.to)
+    const hx = (b.x - a.x) / edge.length
+    const hy = (b.y - a.y) / edge.length
+    const off = ((edge.avenue ? 9 : 5.5) + 2.2) * p.side
+    const x = a.x + hx * p.s + hy * off
+    const y = a.y + hy * p.s - hx * off
+    return { x, y, hx, hy, lngLat: city.toLngLat(x, y) }
+  }
+
+  buildPedFrame(): GeoJSON.FeatureCollection {
+    const features: GeoJSON.Feature[] = []
+    for (const p of this.peds) {
+      features.push({
+        type: "Feature",
+        properties: { color: p.color },
+        geometry: { type: "Point", coordinates: this.position(p).lngLat },
+      })
+    }
+    return { type: "FeatureCollection", features }
+  }
+
+  /** Person-class detection boxes/labels, same shape as the vehicle frames. */
+  buildDetectionFrame(): { boxes: GeoJSON.Feature[]; labels: GeoJSON.Feature[] } {
+    const boxes: GeoJSON.Feature[] = []
+    const labels: GeoJSON.Feature[] = []
+    for (const p of this.peds) {
+      const pos = this.position(p)
+      const hl = 0.9
+      const hw = 0.8
+      const px = pos.hy
+      const py = -pos.hx
+      const c = (dx: number, dy: number) =>
+        this.sim.city.toLngLat(pos.x + pos.hx * dx + px * dy, pos.y + pos.hy * dx + py * dy)
+      boxes.push({
+        type: "Feature",
+        properties: { color: PED_BOX_COLOR },
+        geometry: { type: "LineString", coordinates: [c(hl, hw), c(hl, -hw), c(-hl, -hw), c(-hl, hw), c(hl, hw)] },
+      })
+      labels.push({
+        type: "Feature",
+        properties: { color: PED_BOX_COLOR, label: `person ${p.conf.toFixed(2)} #P${p.id}` },
+        geometry: { type: "Point", coordinates: c(hl + 0.8, 0) },
+      })
+    }
+    return { boxes, labels }
   }
 }

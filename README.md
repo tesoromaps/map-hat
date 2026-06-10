@@ -18,7 +18,10 @@ A procedurally generated city block sandbox rendered with MapLibre GL:
 
 - **Multi-agent traffic** — cars, taxis, buses and trucks navigate a signalized
   road grid with car-following, stop lines, yellow-light decisions and random
-  turning at intersections.
+  turning at intersections. Buses pull up and dwell at curbside bus stops.
+  Click any vehicle to follow it with the camera.
+- **Pedestrians** — sidewalk-walking agents that wait at signalized corners
+  until cross-traffic has the red, with person-class detection boxes.
 - **Live detection overlay** — toggleable CV-style bounding boxes around every
   vehicle with class, confidence and track ID labels, plus fading track trails.
 - **Census-style tracts** — choropleth tract polygons with synthetic population,

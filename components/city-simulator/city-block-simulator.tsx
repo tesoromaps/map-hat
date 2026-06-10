@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react"
 import maplibregl from "maplibre-gl"
 import "maplibre-gl/dist/maplibre-gl.css"
 import { generateCity, type CityModel } from "@/lib/city-simulator/citygen"
-import { TrafficSim, type VehicleKind } from "@/lib/city-simulator/traffic"
+import { TrafficSim, PedestrianSim, type VehicleKind } from "@/lib/city-simulator/traffic"
 import { paletteForHour, formatClock, dayPhase } from "@/lib/city-simulator/daynight"
 import { importGeoFiles, ACCEPTED_EXTENSIONS, type ImportedLayer } from "@/lib/city-simulator/geo-import"
 
@@ -15,6 +15,7 @@ const IMPORT_ANCHOR = "trails" // imported overlays are inserted below the sim g
 interface UiState {
   playing: boolean
   vehicleCount: number
+  pedCount: number
   simSpeed: number
   hour: number
   autoCycle: boolean
@@ -43,6 +44,7 @@ interface Stats {
 const DEFAULT_UI: UiState = {
   playing: true,
   vehicleCount: 90,
+  pedCount: 60,
   simSpeed: 1,
   hour: 17.5,
   autoCycle: true,
@@ -62,6 +64,8 @@ export function CityBlockSimulator() {
   const mapRef = useRef<maplibregl.Map | null>(null)
   const cityRef = useRef<CityModel | null>(null)
   const simRef = useRef<TrafficSim | null>(null)
+  const pedSimRef = useRef<PedestrianSim | null>(null)
+  const followRef = useRef<number | null>(null)
   const loadedRef = useRef(false)
   const importIdRef = useRef(1)
 
@@ -71,6 +75,7 @@ export function CityBlockSimulator() {
   const [stats, setStats] = useState<Stats>({ counts: { car: 0, taxi: 0, bus: 0, truck: 0 }, avgKmh: 0, fps: 0 })
   const [clock, setClock] = useState({ hour: DEFAULT_UI.hour, night: 0 })
   const [imports, setImports] = useState<ImportEntry[]>([])
+  const [following, setFollowing] = useState<string | null>(null)
   const [importError, setImportError] = useState<string | null>(null)
   const [importing, setImporting] = useState(false)
   const [dragOver, setDragOver] = useState(false)
@@ -81,8 +86,11 @@ export function CityBlockSimulator() {
     const city = generateCity({ centerLng: CITY_CENTER[0], centerLat: CITY_CENTER[1], blocksX: 10, blocksY: 8, seed: 20260610 })
     const sim = new TrafficSim(city, 99)
     sim.setVehicleCount(uiRef.current.vehicleCount)
+    const pedSim = new PedestrianSim(sim, 7)
+    pedSim.setCount(uiRef.current.pedCount)
     cityRef.current = city
     simRef.current = sim
+    pedSimRef.current = pedSim
 
     const pal0 = paletteForHour(uiRef.current.hour)
     const map = new maplibregl.Map({
@@ -114,8 +122,9 @@ export function CityBlockSimulator() {
       addSrc("crosswalks", city.geo.crosswalks)
       addSrc("buildings", city.geo.buildings)
       addSrc("streetlights", city.geo.streetlights)
+      addSrc("bus-stops", city.geo.busStops)
       addSrc("beacon", { type: "FeatureCollection", features: [{ type: "Feature", properties: {}, geometry: { type: "Point", coordinates: city.toLngLat(city.beacon.x, city.beacon.y) } }] })
-      for (const id of ["trails", "headlights", "vehicles", "boxes", "box-labels", "signals"]) addSrc(id, EMPTY_FC)
+      for (const id of ["trails", "headlights", "vehicles", "peds", "boxes", "box-labels", "signals"]) addSrc(id, EMPTY_FC)
 
       map.addLayer({
         id: "tracts-fill", type: "fill", source: "tracts",
@@ -189,7 +198,26 @@ export function CityBlockSimulator() {
           "circle-opacity": 0,
         },
       })
+      map.addLayer({
+        id: "bus-stops", type: "circle", source: "bus-stops", minzoom: 14.5,
+        paint: {
+          "circle-color": "#fbbf24",
+          "circle-radius": ["interpolate", ["exponential", 2], ["zoom"], 14, 1.5, 18, 6],
+          "circle-stroke-color": "#78350f",
+          "circle-stroke-width": 1,
+          "circle-opacity": 0.9,
+        },
+      })
       map.addLayer({ id: "vehicles", type: "fill", source: "vehicles", paint: { "fill-color": ["get", "color"], "fill-opacity": 0.97 } })
+      map.addLayer({
+        id: "peds", type: "circle", source: "peds", minzoom: 14,
+        paint: {
+          "circle-color": ["get", "color"],
+          "circle-radius": ["interpolate", ["exponential", 2], ["zoom"], 14, 1, 18, 5],
+          "circle-stroke-color": "#1e293b",
+          "circle-stroke-width": 0.5,
+        },
+      })
       map.addLayer({
         id: "boxes", type: "line", source: "boxes",
         paint: { "line-color": ["get", "color"], "line-width": 1.6, "line-opacity": 0.95 },
@@ -240,26 +268,63 @@ export function CityBlockSimulator() {
         paint: { "text-color": pal0.text, "text-halo-color": pal0.textHalo, "text-halo-width": 1.4, "text-opacity": 0.85 },
       })
 
-      // Tract info popup
-      map.on("click", "tracts-fill", (e) => {
-        const f = e.features?.[0]
-        if (!f) return
-        const p = f.properties as Record<string, string | number>
-        new maplibregl.Popup({ closeButton: true, maxWidth: "260px" })
-          .setLngLat(e.lngLat)
-          .setHTML(
-            `<div style="font-family:ui-monospace,monospace;font-size:12px;line-height:1.6;color:#0f172a">
-               <strong>Census Tract ${p.tractId}</strong><br/>
-               Population: ${Number(p.population).toLocaleString()}<br/>
-               Density: ${Number(p.density).toLocaleString()} /km²<br/>
-               Median income: $${Number(p.medianIncome).toLocaleString()}<br/>
-               Area: ${p.areaKm2} km²
-             </div>`,
-          )
-          .addTo(map)
+      // Unified click handling: follow a vehicle > inspect imported feature > tract info
+      const esc = (s: string) =>
+        s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!)
+      map.on("click", (e) => {
+        const feats = map.queryRenderedFeatures(e.point)
+        const vehicle = feats.find((f) => f.layer.id === "vehicles")
+        if (vehicle?.properties) {
+          followRef.current = Number(vehicle.properties.id)
+          setFollowing(`${vehicle.properties.kind} #${vehicle.properties.id}`)
+          return
+        }
+        if (followRef.current !== null) {
+          followRef.current = null
+          setFollowing(null)
+        }
+        const imported = feats.find((f) => f.layer.id.startsWith("imp-"))
+        if (imported) {
+          const props = (imported.properties || {}) as Record<string, unknown>
+          const rows = Object.entries(props)
+            .slice(0, 12)
+            .map(([k, v]) => `<div><strong>${esc(k)}:</strong> ${esc(String(v))}</div>`)
+            .join("")
+          new maplibregl.Popup({ closeButton: true, maxWidth: "280px" })
+            .setLngLat(e.lngLat)
+            .setHTML(
+              `<div style="font-family:ui-monospace,monospace;font-size:12px;line-height:1.6;color:#0f172a;max-height:220px;overflow:auto">
+                 <strong>Imported feature</strong><br/>${rows || "<em>No properties</em>"}
+               </div>`,
+            )
+            .addTo(map)
+          return
+        }
+        const tract = feats.find((f) => f.layer.id === "tracts-fill")
+        if (tract?.properties) {
+          const p = tract.properties as Record<string, string | number>
+          new maplibregl.Popup({ closeButton: true, maxWidth: "260px" })
+            .setLngLat(e.lngLat)
+            .setHTML(
+              `<div style="font-family:ui-monospace,monospace;font-size:12px;line-height:1.6;color:#0f172a">
+                 <strong>Census Tract ${p.tractId}</strong><br/>
+                 Population: ${Number(p.population).toLocaleString()}<br/>
+                 Density: ${Number(p.density).toLocaleString()} /km²<br/>
+                 Median income: $${Number(p.medianIncome).toLocaleString()}<br/>
+                 Area: ${p.areaKm2} km²
+               </div>`,
+            )
+            .addTo(map)
+        }
       })
-      map.on("mouseenter", "tracts-fill", () => (map.getCanvas().style.cursor = "pointer"))
-      map.on("mouseleave", "tracts-fill", () => (map.getCanvas().style.cursor = ""))
+      map.on("dragstart", () => {
+        if (followRef.current !== null) {
+          followRef.current = null
+          setFollowing(null)
+        }
+      })
+      map.on("mouseenter", "vehicles", () => (map.getCanvas().style.cursor = "pointer"))
+      map.on("mouseleave", "vehicles", () => (map.getCanvas().style.cursor = ""))
 
       loadedRef.current = true
     })
@@ -284,9 +349,10 @@ export function CityBlockSimulator() {
         fpsWindowStart = now
       }
       const u = uiRef.current
-      if (!loadedRef.current || !mapRef.current || !simRef.current) return
+      if (!loadedRef.current || !mapRef.current || !simRef.current || !pedSimRef.current) return
       const m = mapRef.current
       const s = simRef.current
+      const ps = pedSimRef.current
 
       if (u.playing) {
         // Sub-step physics for stability at high sim speeds
@@ -294,6 +360,7 @@ export function CityBlockSimulator() {
         while (remaining > 0) {
           const step = Math.min(0.05, remaining)
           s.step(step)
+          ps.step(step)
           remaining -= step
         }
         if (u.autoCycle) {
@@ -309,14 +376,29 @@ export function CityBlockSimulator() {
         if (src) src.setData(data)
       }
       setData("vehicles", s.buildVehicleFrame())
+      setData("peds", ps.buildPedFrame())
       if (u.showBoxes || u.showLabels) {
         const det = s.buildDetectionFrame()
+        const pedDet = ps.buildDetectionFrame()
+        det.boxes.features.push(...pedDet.boxes)
+        det.labels.features.push(...pedDet.labels)
         if (u.showBoxes) setData("boxes", det.boxes)
         if (u.showLabels) setData("box-labels", det.labels)
       }
       if (u.showTrails) setData("trails", s.buildTrailFrame())
       if (u.showSignals) setData("signals", s.buildTrafficLightFrame())
       if (pal.night > 0.05) setData("headlights", s.buildHeadlightFrame())
+
+      // Follow camera: track the selected vehicle until click-away or drag
+      if (followRef.current !== null) {
+        const target = s.vehicles.find((v) => v.id === followRef.current)
+        if (target) {
+          m.jumpTo({ center: s.position(target).lngLat })
+        } else {
+          followRef.current = null
+          setFollowing(null)
+        }
+      }
 
       // Blinking rooftop beacon (infrastructure animation)
       const blink = Math.sin(now / 280) > 0.2 ? 0.95 : 0.08
@@ -371,6 +453,10 @@ export function CityBlockSimulator() {
   useEffect(() => {
     simRef.current?.setVehicleCount(ui.vehicleCount)
   }, [ui.vehicleCount])
+
+  useEffect(() => {
+    pedSimRef.current?.setCount(ui.pedCount)
+  }, [ui.pedCount])
 
   useEffect(() => {
     const m = mapRef.current
@@ -532,10 +618,17 @@ export function CityBlockSimulator() {
         </div>
       </div>
 
+      {/* Follow-mode chip */}
+      {following && (
+        <div className="absolute left-1/2 top-20 z-20 -translate-x-1/2 rounded-full border border-cyan-500/50 bg-cyan-950/90 px-4 py-1 font-mono text-xs text-cyan-300 shadow-lg backdrop-blur">
+          ◉ FOLLOWING {following} — click empty map or drag to release
+        </div>
+      )}
+
       {/* Stats strip */}
       <div className="absolute bottom-4 left-4 z-20 rounded-lg border border-slate-700/60 bg-slate-900/80 px-4 py-2 font-mono text-[11px] leading-5 text-slate-300 shadow-xl backdrop-blur">
         <div>
-          <span className="text-cyan-400">AGENTS</span> car {stats.counts.car} · taxi {stats.counts.taxi} · bus {stats.counts.bus} · truck {stats.counts.truck}
+          <span className="text-cyan-400">AGENTS</span> car {stats.counts.car} · taxi {stats.counts.taxi} · bus {stats.counts.bus} · truck {stats.counts.truck} · ped {ui.pedCount}
         </div>
         <div>
           <span className="text-cyan-400">AVG SPEED</span> {stats.avgKmh.toFixed(1)} km/h · <span className="text-cyan-400">FPS</span> {stats.fps}
@@ -560,9 +653,15 @@ export function CityBlockSimulator() {
         <input type="range" min={0} max={220} value={ui.vehicleCount} onChange={(e) => set("vehicleCount", +e.target.value)} className="mb-3 w-full accent-cyan-400" />
 
         <label className="mb-1 block text-xs text-slate-400">
+          Pedestrians: <span className="font-mono text-slate-200">{ui.pedCount}</span>
+        </label>
+        <input type="range" min={0} max={150} value={ui.pedCount} onChange={(e) => set("pedCount", +e.target.value)} className="mb-3 w-full accent-cyan-400" />
+
+        <label className="mb-1 block text-xs text-slate-400">
           Sim speed: <span className="font-mono text-slate-200">{ui.simSpeed.toFixed(2)}×</span>
         </label>
-        <input type="range" min={0.25} max={5} step={0.25} value={ui.simSpeed} onChange={(e) => set("simSpeed", +e.target.value)} className="mb-3 w-full accent-cyan-400" />
+        <input type="range" min={0.25} max={5} step={0.25} value={ui.simSpeed} onChange={(e) => set("simSpeed", +e.target.value)} className="mb-1 w-full accent-cyan-400" />
+        <p className="mb-3 text-[10px] text-slate-500">Tip: click any vehicle to follow it with the camera.</p>
 
         <div className="mb-3 border-t border-slate-700/60 pt-3">
           <h3 className="mb-1 text-xs font-bold uppercase tracking-wider text-cyan-300">Day / Night</h3>

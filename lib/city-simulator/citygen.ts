@@ -40,6 +40,7 @@ export interface CityModel {
   edges: RoadEdge[]
   outgoing: number[][] // node id -> edge ids leaving that node
   reverseEdge: number[] // edge id -> opposite-direction edge id
+  busStops: Map<number, number> // edge id -> stop position (meters along edge)
   toLngLat: (x: number, y: number) => LngLat
   nodePos: (id: number) => { x: number; y: number }
   beacon: { x: number; y: number; height: number }
@@ -53,6 +54,7 @@ export interface CityModel {
     streetlights: GeoJSON.FeatureCollection
     trees: GeoJSON.FeatureCollection
     crosswalks: GeoJSON.FeatureCollection
+    busStops: GeoJSON.FeatureCollection
   }
 }
 
@@ -290,6 +292,26 @@ export function generateCity(config: CityConfig): CityModel {
   for (let j = 0; j < ny; j++) addLights(xs[0], ys[j], xs[nx - 1], ys[j], isAvenueY(j))
   for (let i = 0; i < nx; i++) addLights(xs[i], ys[0], xs[i], ys[ny - 1], isAvenueX(i))
 
+  // Bus stops on avenue edges: buses pull up and dwell here. Marker sits on
+  // the curb to the right of the direction of travel.
+  const busStops = new Map<number, number>()
+  const busStopFeatures: GeoJSON.Feature[] = []
+  for (const e of edges) {
+    if (!e.avenue || e.length < 100 || rng() > 0.45) continue
+    const s = e.length * (0.4 + rng() * 0.25)
+    busStops.set(e.id, s)
+    const a = nodes[e.from]
+    const b = nodes[e.to]
+    const hx = (b.x - a.x) / e.length
+    const hy = (b.y - a.y) / e.length
+    const off = halfW(true) + 1.5
+    busStopFeatures.push({
+      type: "Feature",
+      properties: {},
+      geometry: { type: "Point", coordinates: toLngLat(a.x + hx * s + hy * off, a.y + hy * s - hx * off) },
+    })
+  }
+
   // Crosswalk stripes at signalized intersections
   const crosswalkFeatures: GeoJSON.Feature[] = []
   for (const n of nodes) {
@@ -312,6 +334,7 @@ export function generateCity(config: CityConfig): CityModel {
     edges,
     outgoing,
     reverseEdge,
+    busStops,
     toLngLat,
     nodePos: (id: number) => ({ x: nodes[id].x, y: nodes[id].y }),
     beacon,
@@ -325,6 +348,7 @@ export function generateCity(config: CityConfig): CityModel {
       streetlights: fc(streetlightFeatures),
       trees: fc(treeFeatures),
       crosswalks: fc(crosswalkFeatures),
+      busStops: fc(busStopFeatures),
     },
   }
 }
