@@ -104,7 +104,7 @@ export default function MapPreview({ geoJSON }: MapPreviewProps) {
             }
             html += "</div>"
 
-            new maplibregl.Popup().setLngLat(coordinates).setHTML(html).addTo(map.current)
+            if (map.current) new maplibregl.Popup().setLngLat(coordinates).setHTML(html).addTo(map.current)
           }
         })
 
