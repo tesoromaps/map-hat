@@ -7,10 +7,17 @@ import { generateCity, type CityModel } from "@/lib/city-simulator/citygen"
 import { TrafficSim, PedestrianSim, type VehicleKind } from "@/lib/city-simulator/traffic"
 import { paletteForHour, formatClock, dayPhase } from "@/lib/city-simulator/daynight"
 import { importGeoFiles, ACCEPTED_EXTENSIONS, type ImportedLayer } from "@/lib/city-simulator/geo-import"
+import { BASEMAPS, DEFAULT_BASEMAP, getBasemap, type Basemap } from "@/lib/city-simulator/basemaps"
+import { geocode, type GeocodeResult } from "@/lib/city-simulator/geocode"
 
-const CITY_CENTER: [number, number] = [-122.4194, 37.7749]
+const DEFAULT_CENTER: [number, number] = [-122.4194, 37.7749]
+const BLOCKS_X = 10
+const BLOCKS_Y = 8
 const EMPTY_FC: GeoJSON.FeatureCollection = { type: "FeatureCollection", features: [] }
-const IMPORT_ANCHOR = "trails" // imported overlays are inserted below the sim graphics
+// Imported overlays sit above the synthetic city graphics but below text labels,
+// so a dropped shapefile/KML always shows instead of hiding under the buildings.
+const IMPORT_ANCHOR = "box-labels"
+const DYNAMIC_SOURCES = ["trails", "headlights", "vehicles", "peds", "boxes", "box-labels", "signals"]
 
 interface UiState {
   playing: boolean
@@ -20,6 +27,8 @@ interface UiState {
   hour: number
   autoCycle: boolean
   dayLengthSec: number
+  basemap: string
+  groundOpacity: number
   showBoxes: boolean
   showLabels: boolean
   showTrails: boolean
@@ -49,6 +58,8 @@ const DEFAULT_UI: UiState = {
   hour: 17.5,
   autoCycle: true,
   dayLengthSec: 150,
+  basemap: DEFAULT_BASEMAP,
+  groundOpacity: 1,
   showBoxes: true,
   showLabels: true,
   showTrails: true,
@@ -56,6 +67,58 @@ const DEFAULT_UI: UiState = {
   show3d: true,
   showSignals: true,
   showStreetlights: true,
+}
+
+function seedFromCoords(lng: number, lat: number): number {
+  const n = (Math.floor((lng + 180) * 8192) ^ Math.floor((lat + 90) * 8192)) >>> 0
+  return n || 1
+}
+
+function beaconFC(city: CityModel): GeoJSON.FeatureCollection {
+  return {
+    type: "FeatureCollection",
+    features: [{ type: "Feature", properties: {}, geometry: { type: "Point", coordinates: city.toLngLat(city.beacon.x, city.beacon.y) } }],
+  }
+}
+
+/** Rewrite every static city source from a (re)generated model. */
+function writeCitySources(map: maplibregl.Map, city: CityModel) {
+  const set = (id: string, data: GeoJSON.FeatureCollection) => (map.getSource(id) as maplibregl.GeoJSONSource | undefined)?.setData(data)
+  set("tracts", city.geo.tracts)
+  set("tract-labels", city.geo.tractLabels)
+  set("blocks", city.geo.blocks)
+  set("parks", city.geo.parks)
+  set("trees", city.geo.trees)
+  set("roads", city.geo.roads)
+  set("crosswalks", city.geo.crosswalks)
+  set("buildings", city.geo.buildings)
+  set("streetlights", city.geo.streetlights)
+  set("bus-stops", city.geo.busStops)
+  set("beacon", beaconFC(city))
+}
+
+/** Swap the bottom raster basemap layer, syncing its night brightness. */
+function applyBasemap(map: maplibregl.Map, bm: Basemap, night: number) {
+  if (map.getLayer("basemap-layer")) map.removeLayer("basemap-layer")
+  if (map.getSource("basemap")) map.removeSource("basemap")
+  if (!bm.tiles) return
+  map.addSource("basemap", {
+    type: "raster",
+    tiles: bm.tiles,
+    tileSize: 256,
+    maxzoom: bm.maxzoom,
+    attribution: bm.attribution,
+  })
+  const before = map.getLayer("tracts-fill") ? "tracts-fill" : undefined
+  map.addLayer(
+    {
+      id: "basemap-layer",
+      type: "raster",
+      source: "basemap",
+      paint: { "raster-brightness-max": 1 - night * 0.55, "raster-saturation": -night * 0.3 },
+    },
+    before,
+  )
 }
 
 export function CityBlockSimulator() {
@@ -66,6 +129,7 @@ export function CityBlockSimulator() {
   const simRef = useRef<TrafficSim | null>(null)
   const pedSimRef = useRef<PedestrianSim | null>(null)
   const followRef = useRef<number | null>(null)
+  const centerRef = useRef<[number, number]>(DEFAULT_CENTER)
   const loadedRef = useRef(false)
   const importIdRef = useRef(1)
 
@@ -74,16 +138,23 @@ export function CityBlockSimulator() {
   uiRef.current = ui
   const [stats, setStats] = useState<Stats>({ counts: { car: 0, taxi: 0, bus: 0, truck: 0 }, avgKmh: 0, fps: 0 })
   const [clock, setClock] = useState({ hour: DEFAULT_UI.hour, night: 0 })
+  const [coords, setCoords] = useState({ lng: DEFAULT_CENTER[0], lat: DEFAULT_CENTER[1], zoom: 15.1 })
   const [imports, setImports] = useState<ImportEntry[]>([])
   const [following, setFollowing] = useState<string | null>(null)
   const [importError, setImportError] = useState<string | null>(null)
   const [importing, setImporting] = useState(false)
   const [dragOver, setDragOver] = useState(false)
 
+  // search state
+  const [searchQuery, setSearchQuery] = useState("")
+  const [results, setResults] = useState<GeocodeResult[]>([])
+  const [searching, setSearching] = useState(false)
+  const [searchError, setSearchError] = useState<string | null>(null)
+
   // ---------- map + simulation bootstrap ----------
   useEffect(() => {
     if (!containerRef.current) return
-    const city = generateCity({ centerLng: CITY_CENTER[0], centerLat: CITY_CENTER[1], blocksX: 10, blocksY: 8, seed: 20260610 })
+    const city = generateCity({ centerLng: DEFAULT_CENTER[0], centerLat: DEFAULT_CENTER[1], blocksX: BLOCKS_X, blocksY: BLOCKS_Y, seed: 20260610 })
     const sim = new TrafficSim(city, 99)
     sim.setVehicleCount(uiRef.current.vehicleCount)
     const pedSim = new PedestrianSim(sim, 7)
@@ -91,6 +162,7 @@ export function CityBlockSimulator() {
     cityRef.current = city
     simRef.current = sim
     pedSimRef.current = pedSim
+    centerRef.current = DEFAULT_CENTER
 
     const pal0 = paletteForHour(uiRef.current.hour)
     const map = new maplibregl.Map({
@@ -101,7 +173,7 @@ export function CityBlockSimulator() {
         sources: {},
         layers: [{ id: "bg", type: "background", paint: { "background-color": pal0.bg } }],
       },
-      center: CITY_CENTER,
+      center: DEFAULT_CENTER,
       zoom: 15.1,
       pitch: 48,
       bearing: -12,
@@ -110,6 +182,8 @@ export function CityBlockSimulator() {
     })
     mapRef.current = map
     map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), "top-left")
+    map.addControl(new maplibregl.ScaleControl({ unit: "metric" }), "bottom-left")
+    map.addControl(new maplibregl.AttributionControl({ compact: true }), "bottom-right")
 
     map.on("load", () => {
       const addSrc = (id: string, data: GeoJSON.FeatureCollection) => map.addSource(id, { type: "geojson", data })
@@ -123,8 +197,8 @@ export function CityBlockSimulator() {
       addSrc("buildings", city.geo.buildings)
       addSrc("streetlights", city.geo.streetlights)
       addSrc("bus-stops", city.geo.busStops)
-      addSrc("beacon", { type: "FeatureCollection", features: [{ type: "Feature", properties: {}, geometry: { type: "Point", coordinates: city.toLngLat(city.beacon.x, city.beacon.y) } }] })
-      for (const id of ["trails", "headlights", "vehicles", "peds", "boxes", "box-labels", "signals"]) addSrc(id, EMPTY_FC)
+      addSrc("beacon", beaconFC(city))
+      for (const id of DYNAMIC_SOURCES) addSrc(id, EMPTY_FC)
 
       map.addLayer({
         id: "tracts-fill", type: "fill", source: "tracts",
@@ -133,8 +207,8 @@ export function CityBlockSimulator() {
           "fill-opacity": 0.1,
         },
       })
-      map.addLayer({ id: "blocks-fill", type: "fill", source: "blocks", paint: { "fill-color": pal0.block } })
-      map.addLayer({ id: "parks-fill", type: "fill", source: "parks", paint: { "fill-color": pal0.park } })
+      map.addLayer({ id: "blocks-fill", type: "fill", source: "blocks", paint: { "fill-color": pal0.block, "fill-opacity": uiRef.current.groundOpacity } })
+      map.addLayer({ id: "parks-fill", type: "fill", source: "parks", paint: { "fill-color": pal0.park, "fill-opacity": uiRef.current.groundOpacity } })
       map.addLayer({
         id: "trees", type: "circle", source: "trees",
         paint: {
@@ -268,6 +342,9 @@ export function CityBlockSimulator() {
         paint: { "text-color": pal0.text, "text-halo-color": pal0.textHalo, "text-halo-width": 1.4, "text-opacity": 0.85 },
       })
 
+      // Bottom raster basemap
+      applyBasemap(map, getBasemap(uiRef.current.basemap), pal0.night)
+
       // Unified click handling: follow a vehicle > inspect imported feature > tract info
       const esc = (s: string) =>
         s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!)
@@ -287,13 +364,13 @@ export function CityBlockSimulator() {
         if (imported) {
           const props = (imported.properties || {}) as Record<string, unknown>
           const rows = Object.entries(props)
-            .slice(0, 12)
+            .slice(0, 14)
             .map(([k, v]) => `<div><strong>${esc(k)}:</strong> ${esc(String(v))}</div>`)
             .join("")
-          new maplibregl.Popup({ closeButton: true, maxWidth: "280px" })
+          new maplibregl.Popup({ closeButton: true, maxWidth: "300px" })
             .setLngLat(e.lngLat)
             .setHTML(
-              `<div style="font-family:ui-monospace,monospace;font-size:12px;line-height:1.6;color:#0f172a;max-height:220px;overflow:auto">
+              `<div style="font-family:ui-monospace,monospace;font-size:12px;line-height:1.6;color:#0f172a;max-height:240px;overflow:auto">
                  <strong>Imported feature</strong><br/>${rows || "<em>No properties</em>"}
                </div>`,
             )
@@ -325,6 +402,15 @@ export function CityBlockSimulator() {
       })
       map.on("mouseenter", "vehicles", () => (map.getCanvas().style.cursor = "pointer"))
       map.on("mouseleave", "vehicles", () => (map.getCanvas().style.cursor = ""))
+
+      // Live coordinate readout (throttled)
+      let lastCoordT = 0
+      map.on("mousemove", (e) => {
+        const now = performance.now()
+        if (now - lastCoordT < 90) return
+        lastCoordT = now
+        setCoords({ lng: e.lngLat.lng, lat: e.lngLat.lat, zoom: map.getZoom() })
+      })
 
       loadedRef.current = true
     })
@@ -428,6 +514,11 @@ export function CityBlockSimulator() {
         m.setPaintProperty("headlights", "circle-opacity", pal.night * 0.5)
         m.setPaintProperty("signal-glow", "circle-opacity", pal.night * 0.65)
         m.setPaintProperty("trees", "circle-color", pal.night > 0.5 ? "#1d3a28" : "#3f8f4f")
+        // Real basemap dims toward night so the day/night cycle still reads
+        if (m.getLayer("basemap-layer")) {
+          m.setPaintProperty("basemap-layer", "raster-brightness-max", 1 - pal.night * 0.55)
+          m.setPaintProperty("basemap-layer", "raster-saturation", -pal.night * 0.3)
+        }
       }
 
       // Throttled React state sync for HUD/stats
@@ -461,6 +552,19 @@ export function CityBlockSimulator() {
   useEffect(() => {
     const m = mapRef.current
     if (!m || !loadedRef.current) return
+    applyBasemap(m, getBasemap(ui.basemap), paletteForHour(uiRef.current.hour).night)
+  }, [ui.basemap])
+
+  useEffect(() => {
+    const m = mapRef.current
+    if (!m || !loadedRef.current) return
+    if (m.getLayer("blocks-fill")) m.setPaintProperty("blocks-fill", "fill-opacity", ui.groundOpacity)
+    if (m.getLayer("parks-fill")) m.setPaintProperty("parks-fill", "fill-opacity", ui.groundOpacity)
+  }, [ui.groundOpacity])
+
+  useEffect(() => {
+    const m = mapRef.current
+    if (!m || !loadedRef.current) return
     const vis = (ids: string[], on: boolean) =>
       ids.forEach((id) => m.getLayer(id) && m.setLayoutProperty(id, "visibility", on ? "visible" : "none"))
     vis(["boxes"], ui.showBoxes)
@@ -473,6 +577,26 @@ export function CityBlockSimulator() {
       m.setPaintProperty("buildings", "fill-extrusion-height", ui.show3d ? ["get", "height"] : 0)
     }
   }, [ui.showBoxes, ui.showLabels, ui.showTrails, ui.showTracts, ui.showSignals, ui.showStreetlights, ui.show3d])
+
+  // ---------- relocate the whole simulation to a new coordinate ----------
+  const relocateCity = useCallback((lng: number, lat: number) => {
+    const m = mapRef.current
+    if (!m || !loadedRef.current) return
+    const city = generateCity({ centerLng: lng, centerLat: lat, blocksX: BLOCKS_X, blocksY: BLOCKS_Y, seed: seedFromCoords(lng, lat) })
+    const sim = new TrafficSim(city, 99)
+    sim.setVehicleCount(uiRef.current.vehicleCount)
+    const pedSim = new PedestrianSim(sim, 7)
+    pedSim.setCount(uiRef.current.pedCount)
+    cityRef.current = city
+    simRef.current = sim
+    pedSimRef.current = pedSim
+    centerRef.current = [lng, lat]
+    followRef.current = null
+    setFollowing(null)
+    writeCitySources(m, city)
+    for (const id of DYNAMIC_SOURCES) (m.getSource(id) as maplibregl.GeoJSONSource | undefined)?.setData(EMPTY_FC)
+    m.flyTo({ center: [lng, lat], zoom: 15.4, pitch: 48, bearing: -12, duration: 1600 })
+  }, [])
 
   // ---------- geo file imports ----------
   const handleFiles = useCallback(async (fileList: FileList | File[]) => {
@@ -492,11 +616,11 @@ export function CityBlockSimulator() {
           m.addLayer({
             id: `imp-${id}-fill`, type: "fill", source: `imp-${id}`,
             filter: ["any", ["==", ["geometry-type"], "Polygon"], ["==", ["geometry-type"], "MultiPolygon"]],
-            paint: { "fill-color": color, "fill-opacity": 0.25 },
+            paint: { "fill-color": color, "fill-opacity": 0.3 },
           }, before)
           m.addLayer({
             id: `imp-${id}-line`, type: "line", source: `imp-${id}`,
-            paint: { "line-color": color, "line-width": 2 },
+            paint: { "line-color": color, "line-width": 2.2 },
           }, before)
           m.addLayer({
             id: `imp-${id}-circle`, type: "circle", source: `imp-${id}`,
@@ -549,8 +673,44 @@ export function CityBlockSimulator() {
     if (entry.bounds && mapRef.current) mapRef.current.fitBounds(entry.bounds, { padding: 80, maxZoom: 17, duration: 1200 })
   }
 
+  const buildAtImport = (entry: ImportEntry) => {
+    const b = entry.bounds
+    if (b) relocateCity((b[0][0] + b[1][0]) / 2, (b[0][1] + b[1][1]) / 2)
+  }
+
   const resetView = () => {
-    mapRef.current?.flyTo({ center: CITY_CENTER, zoom: 15.1, pitch: 48, bearing: -12, duration: 1400 })
+    mapRef.current?.flyTo({ center: centerRef.current, zoom: 15.1, pitch: 48, bearing: -12, duration: 1400 })
+  }
+
+  // ---------- place search ----------
+  const runSearch = useCallback(async () => {
+    if (!searchQuery.trim()) return
+    setSearching(true)
+    setSearchError(null)
+    setResults([])
+    try {
+      const r = await geocode(searchQuery)
+      setResults(r)
+      if (!r.length) setSearchError("No matches found")
+    } catch (err) {
+      setSearchError(err instanceof Error ? err.message : "Search failed")
+    } finally {
+      setSearching(false)
+    }
+  }, [searchQuery])
+
+  const pickResult = (r: GeocodeResult, build: boolean) => {
+    setResults([])
+    setSearchQuery(r.name.split(",")[0])
+    const m = mapRef.current
+    if (!m) return
+    if (build) {
+      relocateCity(r.lng, r.lat)
+    } else if (r.bbox) {
+      m.fitBounds([[r.bbox[0], r.bbox[1]], [r.bbox[2], r.bbox[3]]], { padding: 60, maxZoom: 16, duration: 1500 })
+    } else {
+      m.flyTo({ center: [r.lng, r.lat], zoom: 14, duration: 1500 })
+    }
   }
 
   useEffect(() => {
@@ -610,29 +770,75 @@ export function CityBlockSimulator() {
         </div>
       )}
 
-      {/* HUD: clock + phase */}
-      <div className="absolute left-1/2 top-4 z-20 -translate-x-1/2 rounded-xl border border-slate-700/60 bg-slate-900/80 px-5 py-2 text-center shadow-xl backdrop-blur">
-        <div className="font-mono text-2xl font-bold tabular-nums text-cyan-300">{formatClock(clock.hour)}</div>
-        <div className="text-[11px] uppercase tracking-widest text-slate-400">
-          {phase.icon} {phase.label} · City Block Simulator
+      {/* Search bar */}
+      <div className="absolute left-1/2 top-4 z-20 w-[min(440px,calc(100vw-2rem))] -translate-x-1/2">
+        <div className="flex items-center gap-2 rounded-xl border border-slate-700/60 bg-slate-900/85 px-3 py-2 shadow-xl backdrop-blur">
+          <span className="text-slate-400">🔍</span>
+          <input
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && runSearch()}
+            placeholder="Search a place or address…"
+            className="min-w-0 flex-1 bg-transparent text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none"
+          />
+          <button
+            onClick={runSearch}
+            disabled={searching}
+            className="rounded-md bg-cyan-600 px-3 py-1 text-xs font-semibold text-white hover:bg-cyan-500 disabled:opacity-50"
+          >
+            {searching ? "…" : "Go"}
+          </button>
         </div>
+        {(results.length > 0 || searchError) && (
+          <div className="mt-1 overflow-hidden rounded-xl border border-slate-700/60 bg-slate-900/95 shadow-2xl backdrop-blur">
+            {searchError && <div className="px-3 py-2 text-xs text-amber-300">{searchError}</div>}
+            {results.map((r, i) => (
+              <div key={i} className="flex items-center gap-2 border-b border-slate-800 px-3 py-2 last:border-0 hover:bg-slate-800/60">
+                <button onClick={() => pickResult(r, false)} className="min-w-0 flex-1 text-left" title={r.name}>
+                  <div className="truncate text-xs text-slate-200">{r.name.split(",")[0]}</div>
+                  <div className="truncate text-[10px] text-slate-500">
+                    {r.kind} · {r.lat.toFixed(4)}, {r.lng.toFixed(4)}
+                  </div>
+                </button>
+                <button
+                  onClick={() => pickResult(r, true)}
+                  className="shrink-0 rounded-md bg-emerald-600/90 px-2 py-1 text-[10px] font-semibold text-white hover:bg-emerald-500"
+                  title="Generate the simulation at this location"
+                >
+                  Build here
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
       {/* Follow-mode chip */}
       {following && (
-        <div className="absolute left-1/2 top-20 z-20 -translate-x-1/2 rounded-full border border-cyan-500/50 bg-cyan-950/90 px-4 py-1 font-mono text-xs text-cyan-300 shadow-lg backdrop-blur">
+        <div className="absolute left-1/2 top-[4.5rem] z-20 -translate-x-1/2 rounded-full border border-cyan-500/50 bg-cyan-950/90 px-4 py-1 font-mono text-xs text-cyan-300 shadow-lg backdrop-blur">
           ◉ FOLLOWING {following} — click empty map or drag to release
         </div>
       )}
 
-      {/* Stats strip */}
-      <div className="absolute bottom-4 left-4 z-20 rounded-lg border border-slate-700/60 bg-slate-900/80 px-4 py-2 font-mono text-[11px] leading-5 text-slate-300 shadow-xl backdrop-blur">
+      {/* Stats + coordinate readout */}
+      <div className="absolute bottom-10 left-4 z-20 rounded-lg border border-slate-700/60 bg-slate-900/80 px-4 py-2 font-mono text-[11px] leading-5 text-slate-300 shadow-xl backdrop-blur">
         <div>
           <span className="text-cyan-400">AGENTS</span> car {stats.counts.car} · taxi {stats.counts.taxi} · bus {stats.counts.bus} · truck {stats.counts.truck} · ped {ui.pedCount}
         </div>
         <div>
           <span className="text-cyan-400">AVG SPEED</span> {stats.avgKmh.toFixed(1)} km/h · <span className="text-cyan-400">FPS</span> {stats.fps}
         </div>
+        <div>
+          <span className="text-cyan-400">LAT/LNG</span> {coords.lat.toFixed(5)}, {coords.lng.toFixed(5)} · <span className="text-cyan-400">Z</span> {coords.zoom.toFixed(1)}
+        </div>
+      </div>
+
+      {/* HUD: clock + phase */}
+      <div className="absolute bottom-4 right-4 z-20 rounded-xl border border-slate-700/60 bg-slate-900/80 px-4 py-1.5 text-center shadow-xl backdrop-blur">
+        <span className="font-mono text-lg font-bold tabular-nums text-cyan-300">{formatClock(clock.hour)}</span>
+        <span className="ml-2 text-[11px] uppercase tracking-widest text-slate-400">
+          {phase.icon} {phase.label}
+        </span>
       </div>
 
       {/* Control panel */}
@@ -662,6 +868,34 @@ export function CityBlockSimulator() {
         </label>
         <input type="range" min={0.25} max={5} step={0.25} value={ui.simSpeed} onChange={(e) => set("simSpeed", +e.target.value)} className="mb-1 w-full accent-cyan-400" />
         <p className="mb-3 text-[10px] text-slate-500">Tip: click any vehicle to follow it with the camera.</p>
+
+        <div className="mb-3 border-t border-slate-700/60 pt-3">
+          <h3 className="mb-2 text-xs font-bold uppercase tracking-wider text-cyan-300">Basemap & Location</h3>
+          <div className="mb-2 grid grid-cols-3 gap-1">
+            {BASEMAPS.map((b) => (
+              <button
+                key={b.id}
+                onClick={() => setUi((prev) => ({ ...prev, basemap: b.id, groundOpacity: b.imagery ? 0.4 : 1 }))}
+                className={`rounded-md px-1.5 py-1 text-[10px] font-semibold ${ui.basemap === b.id ? "bg-cyan-600 text-white" : "bg-slate-800 text-slate-300 hover:bg-slate-700"}`}
+              >
+                {b.name}
+              </button>
+            ))}
+          </div>
+          <label className="mb-1 block text-xs text-slate-400">
+            City ground opacity: <span className="font-mono text-slate-200">{Math.round(ui.groundOpacity * 100)}%</span>
+          </label>
+          <input type="range" min={0} max={1} step={0.05} value={ui.groundOpacity} onChange={(e) => set("groundOpacity", +e.target.value)} className="mb-2 w-full accent-cyan-400" />
+          <button
+            onClick={() => {
+              const c = mapRef.current?.getCenter()
+              if (c) relocateCity(c.lng, c.lat)
+            }}
+            className="w-full rounded-md bg-emerald-600 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500"
+          >
+            ⟳ Rebuild city at map center
+          </button>
+        </div>
 
         <div className="mb-3 border-t border-slate-700/60 pt-3">
           <h3 className="mb-1 text-xs font-bold uppercase tracking-wider text-cyan-300">Day / Night</h3>
@@ -712,13 +946,20 @@ export function CityBlockSimulator() {
           </p>
           {importError && <div className="mb-2 rounded-md bg-red-500/15 px-2 py-1.5 text-[11px] text-red-300">{importError}</div>}
           {imports.map((entry) => (
-            <div key={entry.id} className="mb-1.5 flex items-center gap-2 rounded-md bg-slate-800/70 px-2 py-1.5 text-xs">
-              <span className="h-3 w-3 shrink-0 rounded-sm" style={{ background: entry.color }} />
-              <button onClick={() => toggleImport(entry.id)} className={`min-w-0 flex-1 truncate text-left ${entry.visible ? "text-slate-200" : "text-slate-500 line-through"}`} title={`${entry.name} (${entry.fc.features.length} features) — click to toggle`}>
-                {entry.name}
-              </button>
-              <button onClick={() => zoomToImport(entry)} title="Zoom to layer" className="text-slate-400 hover:text-cyan-300">⌖</button>
-              <button onClick={() => removeImport(entry.id)} title="Remove layer" className="text-slate-400 hover:text-red-400">✕</button>
+            <div key={entry.id} className="mb-1.5 rounded-md bg-slate-800/70 px-2 py-1.5 text-xs">
+              <div className="flex items-center gap-2">
+                <span className="h-3 w-3 shrink-0 rounded-sm" style={{ background: entry.color }} />
+                <button onClick={() => toggleImport(entry.id)} className={`min-w-0 flex-1 truncate text-left ${entry.visible ? "text-slate-200" : "text-slate-500 line-through"}`} title={`${entry.name} (${entry.fc.features.length} features) — click to toggle`}>
+                  {entry.name}
+                </button>
+                <button onClick={() => zoomToImport(entry)} title="Zoom to layer" className="text-slate-400 hover:text-cyan-300">⌖</button>
+                <button onClick={() => removeImport(entry.id)} title="Remove layer" className="text-slate-400 hover:text-red-400">✕</button>
+              </div>
+              {entry.bounds && (
+                <button onClick={() => buildAtImport(entry)} className="mt-1 w-full rounded bg-emerald-700/70 py-0.5 text-[10px] font-semibold text-emerald-100 hover:bg-emerald-600">
+                  Build simulation over this layer
+                </button>
+              )}
             </div>
           ))}
           <button onClick={resetView} className="mt-1 w-full rounded-md border border-slate-600 py-1 text-[11px] text-slate-300 hover:bg-slate-800">
