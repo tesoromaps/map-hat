@@ -4,7 +4,19 @@
 // detection boxes, trails, headlight glows and traffic-light states.
 
 import type { CityModel, RoadEdge } from "./citygen"
-import { mulberry32 } from "./citygen"
+import { mulberry32, sampleEdge } from "./citygen"
+
+// Two opposing signal phase groups, binned by approach bearing. On a regular
+// grid this reproduces the N/S vs E/W split; on real road geometry it groups
+// roughly-parallel approaches together.
+function signalGroup(bearingEnd: number): 0 | 1 {
+  return (Math.round(bearingEnd / 90) % 2) as 0 | 1
+}
+
+/** Smallest signed turn (deg, -180..180) from an incoming to an outgoing edge. */
+function turnAngle(from: RoadEdge, to: RoadEdge): number {
+  return ((to.bearingStart - from.bearingEnd + 540) % 360) - 180
+}
 
 export type VehicleKind = "car" | "taxi" | "bus" | "truck"
 
@@ -55,13 +67,12 @@ export class TrafficSim {
     this.rng = mulberry32(seed)
   }
 
-  /** Signal state seen by traffic travelling on `axis` arriving at `nodeId`. */
-  lightState(nodeId: number, axis: "h" | "v"): LightState {
+  /** Signal state for traffic arriving at a node via a given phase group. */
+  private groupState(nodeId: number, group: 0 | 1): LightState {
     const node = this.city.nodes[nodeId]
     if (!node.hasLight) return "g"
     const t = (this.simSeconds + node.lightOffset) % CYCLE
-    // First half of cycle: vertical (north/south) movement has the green.
-    if (axis === "v") {
+    if (group === 0) {
       if (t < 14) return "g"
       if (t < 17) return "y"
       return "r"
@@ -69,6 +80,11 @@ export class TrafficSim {
     if (t < 17) return "r"
     if (t < 31) return "g"
     return "y"
+  }
+
+  /** Signal state an edge's traffic faces at its `to` node. */
+  edgeLightState(edge: RoadEdge): LightState {
+    return this.groupState(edge.to, signalGroup(edge.bearingEnd))
   }
 
   setVehicleCount(n: number) {
@@ -161,7 +177,7 @@ export class TrafficSim {
         }
 
         // Obey the signal at the end of the edge
-        const light = this.lightState(edge.to, edge.axis)
+        const light = this.edgeLightState(edge)
         const stopAt = edge.length - 9 // stop line before the intersection box
         const distToStop = stopAt - v.s
         if (light !== "g" && distToStop > -2) {
@@ -180,10 +196,17 @@ export class TrafficSim {
         // Crossed the intersection: pick the next edge
         if (v.s >= edge.length) {
           const next = this.chooseNext(edge)
-          v.s -= edge.length
-          v.edgeId = next.id
-          v.lane = Math.min(v.lane, next.lanes - 1)
-          if (next.lanes > 1 && this.rng() < 0.15) v.lane = v.lane === 0 ? 1 : 0
+          if (!next) {
+            // One-way sink with nowhere to go: respawn this vehicle elsewhere.
+            const fresh = this.spawn()
+            if (fresh) Object.assign(v, { edgeId: fresh.edgeId, lane: fresh.lane, s: fresh.s, speed: fresh.speed, trail: [] })
+            else v.s = edge.length
+          } else {
+            v.s -= edge.length
+            v.edgeId = next.id
+            v.lane = Math.min(v.lane, next.lanes - 1)
+            if (next.lanes > 1 && this.rng() < 0.15) v.lane = v.lane === 0 ? 1 : 0
+          }
         }
 
         // Detection confidence random walk
@@ -200,37 +223,25 @@ export class TrafficSim {
     }
   }
 
-  private chooseNext(edge: RoadEdge): RoadEdge {
-    const out = this.city.outgoing[edge.to]
+  private chooseNext(edge: RoadEdge): RoadEdge | null {
     const reverse = this.city.reverseEdge[edge.id]
-    const straight: RoadEdge[] = []
-    const turns: RoadEdge[] = []
-    for (const id of out) {
-      if (id === reverse) continue
-      const e = this.city.edges[id]
-      if (e.axis === edge.axis && e.sign === edge.sign) straight.push(e)
-      else turns.push(e)
-    }
-    const r = this.rng()
-    if (straight.length && (r < 0.62 || turns.length === 0)) return straight[0]
-    if (turns.length) return turns[Math.floor(this.rng() * turns.length)]
-    return this.city.edges[reverse] // dead end: U-turn
+    const cands = this.city.outgoing[edge.to].filter((id) => id !== reverse).map((id) => this.city.edges[id])
+    if (!cands.length) return reverse >= 0 ? this.city.edges[reverse] : null
+    // Rank by how close each option is to going straight through the node.
+    cands.sort((a, b) => Math.abs(turnAngle(edge, a)) - Math.abs(turnAngle(edge, b)))
+    if (this.rng() < 0.62) return cands[0] // usually carry straight on
+    return cands[Math.floor(this.rng() * cands.length)]
   }
 
   /** World position, heading unit vector and lane-offset for a vehicle. */
   position(v: Vehicle): { x: number; y: number; hx: number; hy: number; lngLat: [number, number] } {
     const edge = this.city.edges[v.edgeId]
-    const a = this.city.nodePos(edge.from)
-    const b = this.city.nodePos(edge.to)
-    const hx = (b.x - a.x) / edge.length
-    const hy = (b.y - a.y) / edge.length
+    const g = sampleEdge(edge, v.s)
     // Right-hand traffic: offset perpendicular-right of heading
     const off = 2.6 + v.lane * 3.1
-    const px = hy
-    const py = -hx
-    const x = a.x + hx * v.s + px * off
-    const y = a.y + hy * v.s + py * off
-    return { x, y, hx, hy, lngLat: this.city.toLngLat(x, y) }
+    const x = g.x + g.hy * off
+    const y = g.y - g.hx * off
+    return { x, y, hx: g.hx, hy: g.hy, lngLat: this.city.toLngLat(x, y) }
   }
 
   // ---------- GeoJSON frame builders ----------
@@ -309,28 +320,21 @@ export class TrafficSim {
     return { type: "FeatureCollection", features }
   }
 
-  /** One point per approach at every signalized intersection, colored by state. */
+  /** One signal head per approach into every signalized node, colored by state. */
   buildTrafficLightFrame(): GeoJSON.FeatureCollection {
     const features: GeoJSON.Feature[] = []
     const colorOf: Record<LightState, string> = { g: "#2bd96f", y: "#ffce3a", r: "#ff4a4a" }
-    for (const node of this.city.nodes) {
-      if (!node.hasLight) continue
-      const sv = this.lightState(node.id, "v")
-      const sh = this.lightState(node.id, "h")
-      // Place lights at the corner of each approach (right-hand side of incoming traffic)
-      const lights: Array<{ dx: number; dy: number; st: LightState }> = [
-        { dx: 7, dy: -7, st: sv }, // northbound approach, SE corner
-        { dx: -7, dy: 7, st: sv }, // southbound approach, NW corner
-        { dx: -7, dy: -7, st: sh }, // eastbound approach, SW corner
-        { dx: 7, dy: 7, st: sh }, // westbound approach, NE corner
-      ]
-      for (const l of lights) {
-        features.push({
-          type: "Feature",
-          properties: { color: colorOf[l.st] },
-          geometry: { type: "Point", coordinates: this.city.toLngLat(node.x + l.dx, node.y + l.dy) },
-        })
-      }
+    for (const edge of this.city.edges) {
+      if (!this.city.nodes[edge.to].hasLight) continue
+      const g = sampleEdge(edge, Math.max(0, edge.length - 6))
+      // Offset to the right curb of the approaching lane where the head sits.
+      const x = g.x + g.hy * 4.5
+      const y = g.y - g.hx * 4.5
+      features.push({
+        type: "Feature",
+        properties: { color: colorOf[this.edgeLightState(edge)] },
+        geometry: { type: "Point", coordinates: this.city.toLngLat(x, y) },
+      })
     }
     return { type: "FeatureCollection", features }
   }
@@ -358,8 +362,7 @@ export interface Pedestrian {
   s: number
   side: 1 | -1 // which sidewalk relative to the direction of travel
   speed: number
-  waiting: boolean
-  pendingEdge: number // edge to enter once the crossing is safe
+  pause: number // seconds remaining paused at a corner
   conf: number
   color: string
 }
@@ -387,8 +390,7 @@ export class PedestrianSim {
         s: this.rng() * edge.length,
         side: this.rng() < 0.5 ? 1 : -1,
         speed: 1.1 + this.rng() * 0.7,
-        waiting: false,
-        pendingEdge: -1,
+        pause: 0,
         conf: 0.6 + this.rng() * 0.35,
         color: PED_COLORS[Math.floor(this.rng() * PED_COLORS.length)],
       })
@@ -399,57 +401,42 @@ export class PedestrianSim {
     const city = this.sim.city
     for (const p of this.peds) {
       p.conf = Math.min(0.99, Math.max(0.45, p.conf + (this.rng() - 0.5) * 0.05))
-      const edge = city.edges[p.edgeId]
-      if (p.waiting) {
-        // Crossing the perpendicular street: safe once its traffic has the red
-        const crossAxis = edge.axis === "h" ? "v" : "h"
-        if (this.sim.lightState(edge.to, crossAxis) === "r") {
-          p.edgeId = p.pendingEdge
-          p.s = 0
-          p.waiting = false
-        }
+      if (p.pause > 0) {
+        p.pause -= dt
         continue
       }
+      const edge = city.edges[p.edgeId]
       p.s += p.speed * dt
       if (p.s < edge.length) continue
 
-      // Reached the corner: pick where to go next
+      // Reached the corner: pause at signals, then continue along a sidewalk
       const next = this.chooseNext(edge)
-      const node = city.nodes[edge.to]
-      const goesStraight = next.axis === edge.axis && next.sign === edge.sign
-      if (node.hasLight && goesStraight) {
-        const crossAxis = edge.axis === "h" ? "v" : "h"
-        if (this.sim.lightState(edge.to, crossAxis) !== "r") {
-          p.s = edge.length
-          p.waiting = true
-          p.pendingEdge = next.id
-          continue
-        }
-      }
       p.s -= edge.length
       p.edgeId = next.id
+      if (this.rng() < 0.5) p.side = p.side === 1 ? -1 : 1
+      if (city.nodes[edge.to].hasLight && this.rng() < 0.7) p.pause = 0.5 + this.rng() * 2.5
     }
   }
 
   private chooseNext(edge: RoadEdge): RoadEdge {
     const city = this.sim.city
-    const reverse = city.reverseEdge[edge.id]
-    const options = city.outgoing[edge.to].filter((id) => id !== reverse)
-    if (!options.length) return city.edges[reverse]
+    // Pedestrians ignore one-way restrictions; they can also double back.
+    const options = city.outgoing[edge.to]
+    if (!options.length) {
+      const reverse = city.reverseEdge[edge.id]
+      return reverse >= 0 ? city.edges[reverse] : edge
+    }
     return city.edges[options[Math.floor(this.rng() * options.length)]]
   }
 
   position(p: Pedestrian): { x: number; y: number; hx: number; hy: number; lngLat: [number, number] } {
     const city = this.sim.city
     const edge = city.edges[p.edgeId]
-    const a = city.nodePos(edge.from)
-    const b = city.nodePos(edge.to)
-    const hx = (b.x - a.x) / edge.length
-    const hy = (b.y - a.y) / edge.length
+    const g = sampleEdge(edge, p.s)
     const off = ((edge.avenue ? 9 : 5.5) + 2.2) * p.side
-    const x = a.x + hx * p.s + hy * off
-    const y = a.y + hy * p.s - hx * off
-    return { x, y, hx, hy, lngLat: city.toLngLat(x, y) }
+    const x = g.x + g.hy * off
+    const y = g.y - g.hx * off
+    return { x, y, hx: g.hx, hy: g.hy, lngLat: city.toLngLat(x, y) }
   }
 
   buildPedFrame(): GeoJSON.FeatureCollection {

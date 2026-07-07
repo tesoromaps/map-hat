@@ -22,16 +22,55 @@ export interface RoadNode {
   lightOffset: number // seconds offset into the signal cycle
 }
 
+export interface Pt {
+  x: number
+  y: number
+}
+
 export interface RoadEdge {
   id: number
   from: number
   to: number
-  axis: "h" | "v" // horizontal = east/west travel, vertical = north/south
-  sign: 1 | -1 // +1 = east or north, -1 = west or south
+  axis?: "h" | "v" // grid only; OSM edges use bearings instead
+  sign?: 1 | -1
+  pts: Pt[] // polyline in local meters, ordered from -> to (>= 2 points)
+  cum: number[] // cumulative length at each point; cum[last] === length
   length: number
+  bearingStart: number // heading (deg, 0=N) leaving `from`
+  bearingEnd: number // heading (deg, 0=N) arriving at `to`
   lanes: number
   speedLimit: number // m/s
   avenue: boolean
+}
+
+// Compass bearing in degrees (0 = +y/north, 90 = +x/east).
+export function bearingDeg(ax: number, ay: number, bx: number, by: number): number {
+  return ((Math.atan2(bx - ax, by - ay) * 180) / Math.PI + 360) % 360
+}
+
+/** Cumulative lengths + end bearings for a polyline. */
+export function polylineGeom(pts: Pt[]): { cum: number[]; length: number; bearingStart: number; bearingEnd: number } {
+  const cum = [0]
+  for (let i = 1; i < pts.length; i++) cum.push(cum[i - 1] + Math.hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y))
+  return {
+    cum,
+    length: cum[cum.length - 1],
+    bearingStart: bearingDeg(pts[0].x, pts[0].y, pts[1].x, pts[1].y),
+    bearingEnd: bearingDeg(pts[pts.length - 2].x, pts[pts.length - 2].y, pts[pts.length - 1].x, pts[pts.length - 1].y),
+  }
+}
+
+/** Position + unit heading at distance `s` along an edge's polyline. */
+export function sampleEdge(edge: RoadEdge, s: number): { x: number; y: number; hx: number; hy: number } {
+  const { pts, cum } = edge
+  const sc = Math.max(0, Math.min(edge.length, s))
+  let i = 1
+  while (i < cum.length - 1 && cum[i] < sc) i++
+  const segLen = cum[i] - cum[i - 1] || 1
+  const t = (sc - cum[i - 1]) / segLen
+  const a = pts[i - 1]
+  const b = pts[i]
+  return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t, hx: (b.x - a.x) / segLen, hy: (b.y - a.y) / segLen }
 }
 
 export interface CityModel {
@@ -120,14 +159,19 @@ export function generateCity(config: CityConfig): CityModel {
   const addEdge = (from: number, to: number, axis: "h" | "v", sign: 1 | -1, avenue: boolean) => {
     const a = nodes[from]
     const b = nodes[to]
-    const length = Math.abs(a.x - b.x) + Math.abs(a.y - b.y)
+    const pts: Pt[] = [{ x: a.x, y: a.y }, { x: b.x, y: b.y }]
+    const g = polylineGeom(pts)
     const e: RoadEdge = {
       id: edges.length,
       from,
       to,
       axis,
       sign,
-      length,
+      pts,
+      cum: g.cum,
+      length: g.length,
+      bearingStart: g.bearingStart,
+      bearingEnd: g.bearingEnd,
       lanes: avenue ? 2 : 1,
       speedLimit: avenue ? 15 : 10.5,
       avenue,

@@ -14,8 +14,16 @@ Open [http://localhost:3000](http://localhost:3000) for the AI-enhanced map, or
 
 ## City Block Simulator (`/simulator`)
 
-A procedurally generated city block sandbox rendered with MapLibre GL, georeferenced over real basemaps:
+A traffic-simulation sandbox rendered with MapLibre GL, georeferenced over real
+basemaps and driven by real OpenStreetMap geometry:
 
+- **Real OpenStreetMap city** — "Build here" fetches actual buildings (extruded
+  by their real heights/levels), the drivable road network, and traffic signals
+  from the Overpass API for any location. Agents drive the **real streets**
+  (one-way and turn-restricted where tagged), stop at **real signalized
+  intersections**, and the tallest real building gets the rooftop beacon. Falls
+  back to a procedural grid if a location has too little data or Overpass is
+  unavailable. Toggleable, with an adjustable fetch radius.
 - **Real basemaps & coordinates** — switch between satellite imagery, streets,
   topographic, dark and light basemaps (all keyless: Esri, OpenStreetMap,
   CARTO), with a live lat/lng/zoom readout and scale bar. The synthetic city
@@ -39,10 +47,12 @@ A procedurally generated city block sandbox rendered with MapLibre GL, georefere
   beacon blinks on the tallest tower.
 - **Infrastructure animations** — cycling traffic signals at every interior
   intersection, crosswalks, lane lines, parks with trees, 3D extruded buildings.
-- **Geo data import** — drop or browse for **GeoJSON, KML, KMZ, zipped
-  shapefiles, or loose `.shp` + `.dbf` pairs**; each file becomes a toggleable,
-  removable overlay layer (rendered above the city so it's always visible) with
-  zoom-to-fit, a properties popup, and "build simulation over this layer".
+- **Geo data import + animation** — drop or browse for **GeoJSON, KML, KMZ,
+  zipped shapefiles, or loose `.shp` + `.dbf` pairs**; each file becomes a
+  toggleable, removable overlay (rendered above the city so it's always visible)
+  with zoom-to-fit, a properties popup, and "build simulation over this layer".
+  Each layer can be **animated**: flowing marching-ants glow on lines, pulsing
+  points, or live polygon extrusions.
 
 Key code:
 
@@ -50,8 +60,9 @@ Key code:
 | --- | --- |
 | `app/simulator/page.tsx` | Route (client-only dynamic import) |
 | `components/city-simulator/city-block-simulator.tsx` | Map, render loop, UI panel |
-| `lib/city-simulator/citygen.ts` | Procedural city: road graph, blocks, buildings, tracts |
-| `lib/city-simulator/traffic.ts` | Multi-agent traffic engine + GeoJSON frame builders |
+| `lib/city-simulator/citygen.ts` | Procedural city + shared polyline/bearing geometry helpers |
+| `lib/city-simulator/osm.ts` | OpenStreetMap (Overpass) fetch → real road graph + buildings |
+| `lib/city-simulator/traffic.ts` | Multi-agent traffic engine (polyline edges) + frame builders |
 | `lib/city-simulator/daynight.ts` | Day/night palette keyframes |
 | `lib/city-simulator/geo-import.ts` | Shapefile / KML / KMZ / GeoJSON parsing |
 | `lib/city-simulator/basemaps.ts` | Keyless raster basemap collection |

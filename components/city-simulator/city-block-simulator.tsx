@@ -9,6 +9,9 @@ import { paletteForHour, formatClock, dayPhase } from "@/lib/city-simulator/dayn
 import { importGeoFiles, ACCEPTED_EXTENSIONS, type ImportedLayer } from "@/lib/city-simulator/geo-import"
 import { BASEMAPS, DEFAULT_BASEMAP, getBasemap, type Basemap } from "@/lib/city-simulator/basemaps"
 import { geocode, type GeocodeResult } from "@/lib/city-simulator/geocode"
+import { fetchOSM, buildCityFromOSM } from "@/lib/city-simulator/osm"
+
+type ImportAnim = "none" | "flow" | "pulse" | "extrude"
 
 const DEFAULT_CENTER: [number, number] = [-122.4194, 37.7749]
 const BLOCKS_X = 10
@@ -18,6 +21,12 @@ const EMPTY_FC: GeoJSON.FeatureCollection = { type: "FeatureCollection", feature
 // so a dropped shapefile/KML always shows instead of hiding under the buildings.
 const IMPORT_ANCHOR = "box-labels"
 const DYNAMIC_SOURCES = ["trails", "headlights", "vehicles", "peds", "boxes", "box-labels", "signals"]
+const IMPORT_SUFFIXES = ["fill", "line", "circle", "glow", "extrude"]
+// Canonical marching-ants dash sequence for the flowing-line effect.
+const DASH_SEQUENCE: number[][] = [
+  [0, 4, 3], [0.5, 4, 2.5], [1, 4, 2], [1.5, 4, 1.5], [2, 4, 1], [2.5, 4, 0.5], [3, 4, 0],
+  [0, 0.5, 3, 3.5], [0, 1, 3, 3], [0, 1.5, 3, 2.5], [0, 2, 3, 2], [0, 2.5, 3, 1.5], [0, 3, 3, 1], [0, 3.5, 3, 0.5],
+]
 
 interface UiState {
   playing: boolean
@@ -29,6 +38,8 @@ interface UiState {
   dayLengthSec: number
   basemap: string
   groundOpacity: number
+  osm: boolean
+  osmRadius: number
   showBoxes: boolean
   showLabels: boolean
   showTrails: boolean
@@ -42,6 +53,7 @@ interface ImportEntry extends ImportedLayer {
   id: number
   color: string
   visible: boolean
+  anim: ImportAnim
 }
 
 interface Stats {
@@ -60,6 +72,8 @@ const DEFAULT_UI: UiState = {
   dayLengthSec: 150,
   basemap: DEFAULT_BASEMAP,
   groundOpacity: 1,
+  osm: true,
+  osmRadius: 450,
   showBoxes: true,
   showLabels: true,
   showTrails: true,
@@ -132,6 +146,9 @@ export function CityBlockSimulator() {
   const centerRef = useRef<[number, number]>(DEFAULT_CENTER)
   const loadedRef = useRef(false)
   const importIdRef = useRef(1)
+  const osmAbortRef = useRef<AbortController | null>(null)
+  // Mirror of imported-layer animation state, read by the rAF loop.
+  const importAnimRef = useRef<{ id: number; color: string; anim: ImportAnim }[]>([])
 
   const [ui, setUi] = useState<UiState>(DEFAULT_UI)
   const uiRef = useRef(ui)
@@ -144,6 +161,8 @@ export function CityBlockSimulator() {
   const [importError, setImportError] = useState<string | null>(null)
   const [importing, setImporting] = useState(false)
   const [dragOver, setDragOver] = useState(false)
+  const [osmLoading, setOsmLoading] = useState<string | null>(null)
+  const [osmNote, setOsmNote] = useState<string | null>(null)
 
   // search state
   const [searchQuery, setSearchQuery] = useState("")
@@ -259,7 +278,7 @@ export function CityBlockSimulator() {
         paint: {
           "fill-extrusion-color": pal0.building,
           "fill-extrusion-height": ["get", "height"],
-          "fill-extrusion-base": 0,
+          "fill-extrusion-base": ["coalesce", ["get", "minHeight"], 0],
           "fill-extrusion-opacity": 0.92,
         },
       })
@@ -486,6 +505,28 @@ export function CityBlockSimulator() {
         }
       }
 
+      // Animated import layers: flowing lines, pulsing points, live extrusions
+      for (const im of importAnimRef.current) {
+        if (im.anim === "flow") {
+          const lid = `imp-${im.id}-line`
+          if (m.getLayer(lid)) {
+            m.setPaintProperty(lid, "line-dasharray", DASH_SEQUENCE[Math.floor(now / 55) % DASH_SEQUENCE.length])
+            m.setPaintProperty(lid, "line-width", 3)
+          }
+          const gid = `imp-${im.id}-glow`
+          if (m.getLayer(gid)) m.setPaintProperty(gid, "line-opacity", 0.28 + 0.22 * Math.sin(now / 300))
+        } else if (im.anim === "pulse") {
+          const cid = `imp-${im.id}-circle`
+          if (m.getLayer(cid)) {
+            m.setPaintProperty(cid, "circle-radius", 5 + 3.5 * (0.5 + 0.5 * Math.sin(now / 260 + im.id)))
+            m.setPaintProperty(cid, "circle-opacity", 0.55 + 0.45 * Math.abs(Math.sin(now / 480 + im.id)))
+          }
+        } else if (im.anim === "extrude") {
+          const eid = `imp-${im.id}-extrude`
+          if (m.getLayer(eid)) m.setPaintProperty(eid, "fill-extrusion-opacity", 0.42 + 0.16 * Math.sin(now / 600 + im.id))
+        }
+      }
+
       // Blinking rooftop beacon (infrastructure animation)
       const blink = Math.sin(now / 280) > 0.2 ? 0.95 : 0.08
       if (m.getLayer("beacon")) m.setPaintProperty("beacon", "circle-opacity", blink)
@@ -562,6 +603,11 @@ export function CityBlockSimulator() {
     if (m.getLayer("parks-fill")) m.setPaintProperty("parks-fill", "fill-opacity", ui.groundOpacity)
   }, [ui.groundOpacity])
 
+  // Keep the rAF loop's view of import animations in sync with React state.
+  useEffect(() => {
+    importAnimRef.current = imports.map((e) => ({ id: e.id, color: e.color, anim: e.anim }))
+  }, [imports])
+
   useEffect(() => {
     const m = mapRef.current
     if (!m || !loadedRef.current) return
@@ -579,10 +625,9 @@ export function CityBlockSimulator() {
   }, [ui.showBoxes, ui.showLabels, ui.showTrails, ui.showTracts, ui.showSignals, ui.showStreetlights, ui.show3d])
 
   // ---------- relocate the whole simulation to a new coordinate ----------
-  const relocateCity = useCallback((lng: number, lat: number) => {
+  const installCity = useCallback((city: CityModel, lng: number, lat: number, fly: boolean) => {
     const m = mapRef.current
-    if (!m || !loadedRef.current) return
-    const city = generateCity({ centerLng: lng, centerLat: lat, blocksX: BLOCKS_X, blocksY: BLOCKS_Y, seed: seedFromCoords(lng, lat) })
+    if (!m) return
     const sim = new TrafficSim(city, 99)
     sim.setVehicleCount(uiRef.current.vehicleCount)
     const pedSim = new PedestrianSim(sim, 7)
@@ -595,8 +640,59 @@ export function CityBlockSimulator() {
     setFollowing(null)
     writeCitySources(m, city)
     for (const id of DYNAMIC_SOURCES) (m.getSource(id) as maplibregl.GeoJSONSource | undefined)?.setData(EMPTY_FC)
-    m.flyTo({ center: [lng, lat], zoom: 15.4, pitch: 48, bearing: -12, duration: 1600 })
+    if (fly) m.flyTo({ center: [lng, lat], zoom: 15.6, pitch: 52, bearing: -12, duration: 1600 })
   }, [])
+
+  const relocateCity = useCallback(
+    async (lng: number, lat: number, fly = true) => {
+      if (!mapRef.current || !loadedRef.current) return
+      const seed = seedFromCoords(lng, lat)
+      if (!uiRef.current.osm) {
+        installCity(generateCity({ centerLng: lng, centerLat: lat, blocksX: BLOCKS_X, blocksY: BLOCKS_Y, seed }), lng, lat, fly)
+        return
+      }
+      // Cancel any in-flight OSM request and fetch fresh real-world data.
+      osmAbortRef.current?.abort()
+      const ctrl = new AbortController()
+      osmAbortRef.current = ctrl
+      setOsmLoading("Fetching OpenStreetMap buildings & roads…")
+      setOsmNote(null)
+      try {
+        const els = await fetchOSM(lng, lat, uiRef.current.osmRadius, ctrl.signal)
+        if (ctrl.signal.aborted) return
+        const { city, stats } = buildCityFromOSM(lng, lat, seed, els)
+        installCity(city, lng, lat, fly)
+        setOsmNote(`Real data · ${stats.buildings} buildings · ${stats.roads} roads · ${stats.signals} signals`)
+      } catch (err) {
+        if (ctrl.signal.aborted) return
+        // Graceful fallback so the simulator always produces a city.
+        installCity(generateCity({ centerLng: lng, centerLat: lat, blocksX: BLOCKS_X, blocksY: BLOCKS_Y, seed }), lng, lat, fly)
+        setOsmNote(`OSM unavailable (${err instanceof Error ? err.message : "error"}) — using procedural city`)
+      } finally {
+        if (osmAbortRef.current === ctrl) osmAbortRef.current = null
+        setOsmLoading(null)
+      }
+    },
+    [installCity],
+  )
+
+  // Once the map is ready, upgrade the initial procedural placeholder to real
+  // OpenStreetMap data for the default location (no camera move).
+  const didInitOsm = useRef(false)
+  useEffect(() => {
+    if (didInitOsm.current) return
+    let tries = 0
+    const iv = setInterval(() => {
+      if (loadedRef.current) {
+        clearInterval(iv)
+        didInitOsm.current = true
+        if (uiRef.current.osm) relocateCity(DEFAULT_CENTER[0], DEFAULT_CENTER[1], false)
+      } else if (++tries > 100) {
+        clearInterval(iv)
+      }
+    }, 100)
+    return () => clearInterval(iv)
+  }, [relocateCity])
 
   // ---------- geo file imports ----------
   const handleFiles = useCallback(async (fileList: FileList | File[]) => {
@@ -628,7 +724,7 @@ export function CityBlockSimulator() {
             paint: { "circle-color": color, "circle-radius": 5, "circle-stroke-color": "#fff", "circle-stroke-width": 1.5 },
           }, before)
         }
-        return { ...layer, id, color, visible: true }
+        return { ...layer, id, color, visible: true, anim: "none" as ImportAnim }
       })
       setImports((prev) => [...prev, ...entries])
       const withBounds = entries.find((e) => e.bounds)
@@ -647,7 +743,7 @@ export function CityBlockSimulator() {
         const visible = !entry.visible
         const m = mapRef.current
         if (m) {
-          for (const suffix of ["fill", "line", "circle"]) {
+          for (const suffix of IMPORT_SUFFIXES) {
             const lid = `imp-${id}-${suffix}`
             if (m.getLayer(lid)) m.setLayoutProperty(lid, "visibility", visible ? "visible" : "none")
           }
@@ -660,13 +756,57 @@ export function CityBlockSimulator() {
   const removeImport = (id: number) => {
     const m = mapRef.current
     if (m) {
-      for (const suffix of ["fill", "line", "circle"]) {
+      for (const suffix of IMPORT_SUFFIXES) {
         const lid = `imp-${id}-${suffix}`
         if (m.getLayer(lid)) m.removeLayer(lid)
       }
       if (m.getSource(`imp-${id}`)) m.removeSource(`imp-${id}`)
     }
+    importAnimRef.current = importAnimRef.current.filter((e) => e.id !== id)
     setImports((prev) => prev.filter((entry) => entry.id !== id))
+  }
+
+  // Attach/detach animation effect layers for an imported layer.
+  const setImportAnim = (id: number, anim: ImportAnim) => {
+    const m = mapRef.current
+    const color = imports.find((e) => e.id === id)?.color ?? "#22d3ee"
+    if (m) {
+      const lineId = `imp-${id}-line`
+      const glowId = `imp-${id}-glow`
+      const circId = `imp-${id}-circle`
+      const extId = `imp-${id}-extrude`
+      // Tear down any previous effect and reset base paint.
+      if (m.getLayer(glowId)) m.removeLayer(glowId)
+      if (m.getLayer(extId)) m.removeLayer(extId)
+      if (m.getLayer(lineId)) m.setPaintProperty(lineId, "line-dasharray", null)
+      if (m.getLayer(circId)) {
+        m.setPaintProperty(circId, "circle-radius", 5)
+        m.setPaintProperty(circId, "circle-opacity", 1)
+      }
+      if (anim === "flow" && m.getLayer(lineId)) {
+        m.addLayer(
+          { id: glowId, type: "line", source: `imp-${id}`, paint: { "line-color": color, "line-width": 11, "line-blur": 6, "line-opacity": 0.3 } },
+          lineId,
+        )
+      }
+      if (anim === "extrude") {
+        const before = m.getLayer(IMPORT_ANCHOR) ? IMPORT_ANCHOR : undefined
+        m.addLayer(
+          {
+            id: extId, type: "fill-extrusion", source: `imp-${id}`,
+            filter: ["any", ["==", ["geometry-type"], "Polygon"], ["==", ["geometry-type"], "MultiPolygon"]],
+            paint: {
+              "fill-extrusion-color": color,
+              "fill-extrusion-opacity": 0.5,
+              "fill-extrusion-height": ["case", ["has", "height"], ["to-number", ["get", "height"]], 40],
+              "fill-extrusion-base": 0,
+            },
+          },
+          before,
+        )
+      }
+    }
+    setImports((prev) => prev.map((e) => (e.id === id ? { ...e, anim } : e)))
   }
 
   const zoomToImport = (entry: ImportEntry) => {
@@ -760,6 +900,15 @@ export function CityBlockSimulator() {
           background: "radial-gradient(ellipse at center, transparent 40%, #02040c 100%)",
         }}
       />
+
+      {/* OSM loading overlay */}
+      {osmLoading && (
+        <div className="pointer-events-none absolute left-1/2 top-1/2 z-30 -translate-x-1/2 -translate-y-1/2 rounded-xl border border-cyan-500/40 bg-slate-900/90 px-6 py-4 text-center shadow-2xl backdrop-blur">
+          <div className="mx-auto mb-2 h-6 w-6 animate-spin rounded-full border-2 border-cyan-400 border-t-transparent" />
+          <div className="text-sm font-semibold text-cyan-200">{osmLoading}</div>
+          <div className="mt-0.5 text-[11px] text-slate-400">OpenStreetMap · Overpass API</div>
+        </div>
+      )}
 
       {/* Drag-and-drop hint */}
       {dragOver && (
@@ -886,15 +1035,22 @@ export function CityBlockSimulator() {
             City ground opacity: <span className="font-mono text-slate-200">{Math.round(ui.groundOpacity * 100)}%</span>
           </label>
           <input type="range" min={0} max={1} step={0.05} value={ui.groundOpacity} onChange={(e) => set("groundOpacity", +e.target.value)} className="mb-2 w-full accent-cyan-400" />
+          <Toggle label="Real buildings & roads (OSM)" value={ui.osm} onChange={(v) => set("osm", v)} />
+          <label className="mb-1 mt-1 block text-xs text-slate-400">
+            OSM area radius: <span className="font-mono text-slate-200">{ui.osmRadius} m</span>
+          </label>
+          <input type="range" min={250} max={900} step={50} value={ui.osmRadius} onChange={(e) => set("osmRadius", +e.target.value)} className="mb-2 w-full accent-cyan-400" />
           <button
             onClick={() => {
               const c = mapRef.current?.getCenter()
-              if (c) relocateCity(c.lng, c.lat)
+              if (c) relocateCity(c.lng, c.lat, false)
             }}
-            className="w-full rounded-md bg-emerald-600 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500"
+            disabled={!!osmLoading}
+            className="w-full rounded-md bg-emerald-600 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500 disabled:opacity-50"
           >
-            ⟳ Rebuild city at map center
+            {osmLoading ? "Loading…" : ui.osm ? "⟳ Rebuild from real data here" : "⟳ Rebuild city at map center"}
           </button>
+          {osmNote && <p className="mt-1 text-[10px] leading-4 text-slate-500">{osmNote}</p>}
         </div>
 
         <div className="mb-3 border-t border-slate-700/60 pt-3">
@@ -954,6 +1110,19 @@ export function CityBlockSimulator() {
                 </button>
                 <button onClick={() => zoomToImport(entry)} title="Zoom to layer" className="text-slate-400 hover:text-cyan-300">⌖</button>
                 <button onClick={() => removeImport(entry.id)} title="Remove layer" className="text-slate-400 hover:text-red-400">✕</button>
+              </div>
+              <div className="mt-1 flex items-center gap-1">
+                <span className="text-[10px] text-slate-500">Animate:</span>
+                <select
+                  value={entry.anim}
+                  onChange={(e) => setImportAnim(entry.id, e.target.value as ImportAnim)}
+                  className="flex-1 rounded bg-slate-900 px-1 py-0.5 text-[10px] text-slate-200"
+                >
+                  <option value="none">None</option>
+                  <option value="flow">Flowing glow (lines)</option>
+                  <option value="pulse">Pulse (points)</option>
+                  <option value="extrude">Extrude (polygons)</option>
+                </select>
               </div>
               {entry.bounds && (
                 <button onClick={() => buildAtImport(entry)} className="mt-1 w-full rounded bg-emerald-700/70 py-0.5 text-[10px] font-semibold text-emerald-100 hover:bg-emerald-600">
