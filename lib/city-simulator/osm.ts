@@ -48,39 +48,102 @@ const OVERPASS_ENDPOINTS = [
   "https://overpass.kumi.systems/api/interpreter",
   "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
 ]
+// A stalling mirror must never stall the app: every attempt gets a hard
+// client-side timeout, and mirrors are raced with staggered starts so the
+// fastest healthy one wins.
+const ATTEMPT_TIMEOUT_MS = 14000
+const HEDGE_DELAY_MS = 3000
 
-/** Fetch buildings, roads, greenspace, signals and trees around a point. */
-export async function fetchOSM(lng: number, lat: number, radiusM: number, signal?: AbortSignal): Promise<OSMElement[]> {
+const queryCache = new Map<string, OSMElement[]>()
+
+function overpassFetch(q: string, parentSignal?: AbortSignal): Promise<OSMElement[]> {
+  const cached = queryCache.get(q)
+  if (cached) return Promise.resolve(cached)
+  return new Promise<OSMElement[]>((resolve, reject) => {
+    let settled = false
+    let failures = 0
+    let lastErr: unknown = new Error("Overpass request failed")
+    const ctrls: AbortController[] = []
+    const timers: ReturnType<typeof setTimeout>[] = []
+    const finish = (ok: boolean, val: OSMElement[] | unknown) => {
+      if (settled) return
+      settled = true
+      timers.forEach(clearTimeout)
+      ctrls.forEach((c) => c.abort())
+      if (ok) resolve(val as OSMElement[])
+      else reject(val instanceof Error ? val : new Error(String(val)))
+    }
+    parentSignal?.addEventListener("abort", () => finish(false, new DOMException("Aborted", "AbortError")))
+    const attempt = (ep: string) => {
+      if (settled) return
+      const ctrl = new AbortController()
+      ctrls.push(ctrl)
+      const kill = setTimeout(() => ctrl.abort(), ATTEMPT_TIMEOUT_MS)
+      timers.push(kill)
+      fetch(ep, { method: "POST", body: "data=" + encodeURIComponent(q), signal: ctrl.signal })
+        .then((res) => {
+          if (!res.ok) throw new Error(`Overpass ${res.status}`)
+          return res.json() as Promise<{ elements?: OSMElement[] }>
+        })
+        .then((json) => {
+          const els = json.elements ?? []
+          queryCache.set(q, els)
+          if (queryCache.size > 12) queryCache.delete(queryCache.keys().next().value!)
+          finish(true, els)
+        })
+        .catch((err) => {
+          clearTimeout(kill)
+          lastErr = err
+          failures++
+          if (failures >= OVERPASS_ENDPOINTS.length) finish(false, lastErr)
+        })
+    }
+    OVERPASS_ENDPOINTS.forEach((ep, i) => {
+      timers.push(setTimeout(() => attempt(ep), i * HEDGE_DELAY_MS))
+    })
+  })
+}
+
+function bboxFor(lng: number, lat: number, radiusM: number): string {
   const dLat = radiusM / M_PER_DEG_LAT
   const dLng = radiusM / (M_PER_DEG_LAT * Math.cos((lat * Math.PI) / 180))
-  const bbox = `(${lat - dLat},${lng - dLng},${lat + dLat},${lng + dLng})`
+  return `(${lat - dLat},${lng - dLng},${lat + dLat},${lng + dLng})`
+}
+
+const DRIVABLE_RE = Object.keys(SPEED_LANES).join("|")
+
+/** Small, fast query: just the drivable road network + traffic signals. */
+export function fetchOSMRoads(lng: number, lat: number, radiusM: number, signal?: AbortSignal): Promise<OSMElement[]> {
+  const bbox = bboxFor(lng, lat, radiusM)
   const q =
-    `[out:json][timeout:40];(` +
-    `way["highway"]${bbox};` +
+    `[out:json][timeout:25];(` +
+    `way["highway"~"^(${DRIVABLE_RE})$"]${bbox};` +
+    `node["highway"="traffic_signals"]${bbox};` +
+    `);out geom;`
+  return overpassFetch(q, signal)
+}
+
+/** Heavier query: building footprints, greenspace and trees. */
+export function fetchOSMBuildings(lng: number, lat: number, radiusM: number, signal?: AbortSignal): Promise<OSMElement[]> {
+  const bbox = bboxFor(lng, lat, radiusM)
+  const q =
+    `[out:json][timeout:25];(` +
     `way["building"]${bbox};` +
     `way["leisure"~"^(park|garden|playground|pitch|recreation_ground|golf_course)$"]${bbox};` +
     `way["landuse"~"^(grass|forest|meadow|cemetery)$"]${bbox};` +
     `way["natural"~"^(wood|scrub|grassland)$"]${bbox};` +
-    `node["highway"="traffic_signals"]${bbox};` +
     `node["natural"="tree"]${bbox};` +
     `);out geom;`
-  let lastErr: unknown
-  // Two rounds over the mirrors; Overpass 429/504 "slot busy" is transient.
-  for (let round = 0; round < 2; round++) {
-    for (const ep of OVERPASS_ENDPOINTS) {
-      try {
-        const res = await fetch(ep, { method: "POST", body: "data=" + encodeURIComponent(q), signal })
-        if (!res.ok) throw new Error(`Overpass ${res.status}`)
-        const json = (await res.json()) as { elements?: OSMElement[] }
-        return json.elements ?? []
-      } catch (err) {
-        if (signal?.aborted) throw err
-        lastErr = err
-      }
-    }
-    if (round === 0) await new Promise((r) => setTimeout(r, 1500))
-  }
-  throw lastErr instanceof Error ? lastErr : new Error("Overpass request failed")
+  return overpassFetch(q, signal)
+}
+
+/** Combined fetch (roads + buildings), used by tests and one-shot callers. */
+export async function fetchOSM(lng: number, lat: number, radiusM: number, signal?: AbortSignal): Promise<OSMElement[]> {
+  const [roads, buildings] = await Promise.all([
+    fetchOSMRoads(lng, lat, radiusM, signal),
+    fetchOSMBuildings(lng, lat, radiusM, signal),
+  ])
+  return [...roads, ...buildings]
 }
 
 function parseMaxspeed(v: string): number | null {
@@ -300,35 +363,13 @@ export function buildCityFromOSM(centerLng: number, centerLat: number, seed: num
     })
   }
 
-  // Buildings with heights; track the tallest for the beacon.
-  const buildingFeatures: GeoJSON.Feature[] = []
-  let beacon = { x: 0, y: 0, height: 0 }
-  for (const w of ways) {
-    if (!w.tags?.building) continue
-    const coords = ringClosed(w.geometry!.map((p) => [p.lon, p.lat] as [number, number]))
-    if (coords.length < 4) continue
-    const { height, base } = parseHeight(w.tags, rng)
-    buildingFeatures.push({ type: "Feature", properties: { height, minHeight: base }, geometry: { type: "Polygon", coordinates: [coords] } })
-    if (height > beacon.height) {
-      const c = toXY(w.geometry![0].lon, w.geometry![0].lat)
-      beacon = { x: c.x, y: c.y, height }
-    }
-  }
-
-  // Parks / greenspace polygons and trees.
-  const parkFeatures: GeoJSON.Feature[] = []
-  for (const w of ways) {
-    const t = w.tags
-    if (!t) continue
-    const green = t.leisure || t.landuse || t.natural
-    if (!green || t.building || t.highway) continue
-    const coords = ringClosed(w.geometry!.map((p) => toLngLat(p.lon, p.lat) as [number, number]))
-    if (coords.length < 4) continue
-    parkFeatures.push({ type: "Feature", properties: { park: 1 }, geometry: { type: "Polygon", coordinates: [coords] } })
-  }
-  const treeFeatures: GeoJSON.Feature[] = pointNodes
-    .filter((n) => n.tags?.natural === "tree")
-    .map((n) => ({ type: "Feature", properties: { r: 2 + rng() * 3 }, geometry: { type: "Point", coordinates: [n.lon, n.lat] } }))
+  // Buildings, greenspace and trees may arrive in this element set (combined
+  // fetch) or be streamed in later via buildExtrasFromOSM (progressive fetch).
+  const extras = buildExtrasFromOSM(centerLng, centerLat, seed, elements)
+  const buildingFeatures = extras.buildings.features
+  const parkFeatures = extras.parks.features
+  const treeFeatures = extras.trees.features
+  const beacon = extras.beacon
 
   const config: CityConfig = { centerLng, centerLat, blocksX: 0, blocksY: 0, seed }
   const city: CityModel = {
@@ -357,6 +398,62 @@ export function buildCityFromOSM(centerLng: number, centerLat: number, seed: num
   return {
     city,
     stats: { roads: roadFeatures.length, nodes: nodes.length, buildings: buildingFeatures.length, signals: nodes.filter((n) => n.hasLight).length },
+  }
+}
+
+export interface OSMExtras {
+  buildings: GeoJSON.FeatureCollection
+  parks: GeoJSON.FeatureCollection
+  trees: GeoJSON.FeatureCollection
+  beacon: { x: number; y: number; height: number }
+  counts: { buildings: number; parks: number; trees: number }
+}
+
+/** Buildings, greenspace and trees from Overpass elements (no road graph). */
+export function buildExtrasFromOSM(centerLng: number, centerLat: number, seed: number, elements: OSMElement[]): OSMExtras {
+  const rng = mulberry32(seed ^ 0x51ed270b)
+  const mPerDegLng = M_PER_DEG_LAT * Math.cos((centerLat * Math.PI) / 180)
+  const ways = elements.filter((e): e is OSMWay => e.type === "way" && !!e.geometry && e.geometry.length >= 2)
+  const pointNodes = elements.filter((e): e is OSMNode => e.type === "node")
+
+  const buildingFeatures: GeoJSON.Feature[] = []
+  let beacon = { x: 0, y: 0, height: 0 }
+  for (const w of ways) {
+    if (!w.tags?.building) continue
+    const coords = ringClosed(w.geometry!.map((p) => [p.lon, p.lat] as [number, number]))
+    if (coords.length < 4) continue
+    const { height, base } = parseHeight(w.tags, rng)
+    buildingFeatures.push({ type: "Feature", properties: { height, minHeight: base }, geometry: { type: "Polygon", coordinates: [coords] } })
+    if (height > beacon.height) {
+      beacon = {
+        x: (w.geometry![0].lon - centerLng) * mPerDegLng,
+        y: (w.geometry![0].lat - centerLat) * M_PER_DEG_LAT,
+        height,
+      }
+    }
+  }
+
+  const parkFeatures: GeoJSON.Feature[] = []
+  for (const w of ways) {
+    const t = w.tags
+    if (!t) continue
+    const green = t.leisure || t.landuse || t.natural
+    if (!green || t.building || t.highway) continue
+    const coords = ringClosed(w.geometry!.map((p) => [p.lon, p.lat] as [number, number]))
+    if (coords.length < 4) continue
+    parkFeatures.push({ type: "Feature", properties: { park: 1 }, geometry: { type: "Polygon", coordinates: [coords] } })
+  }
+
+  const treeFeatures: GeoJSON.Feature[] = pointNodes
+    .filter((n) => n.tags?.natural === "tree")
+    .map((n) => ({ type: "Feature", properties: { r: 2 + rng() * 3 }, geometry: { type: "Point", coordinates: [n.lon, n.lat] } }))
+
+  return {
+    buildings: fc(buildingFeatures),
+    parks: fc(parkFeatures),
+    trees: fc(treeFeatures),
+    beacon,
+    counts: { buildings: buildingFeatures.length, parks: parkFeatures.length, trees: treeFeatures.length },
   }
 }
 

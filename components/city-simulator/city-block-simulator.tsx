@@ -9,7 +9,7 @@ import { paletteForHour, formatClock, dayPhase } from "@/lib/city-simulator/dayn
 import { importGeoFiles, ACCEPTED_EXTENSIONS, type ImportedLayer } from "@/lib/city-simulator/geo-import"
 import { BASEMAPS, DEFAULT_BASEMAP, getBasemap, type Basemap } from "@/lib/city-simulator/basemaps"
 import { geocode, type GeocodeResult } from "@/lib/city-simulator/geocode"
-import { fetchOSM, buildCityFromOSM } from "@/lib/city-simulator/osm"
+import { fetchOSMRoads, fetchOSMBuildings, buildCityFromOSM, buildExtrasFromOSM } from "@/lib/city-simulator/osm"
 
 type ImportAnim = "none" | "flow" | "pulse" | "extrude"
 
@@ -89,6 +89,7 @@ function seedFromCoords(lng: number, lat: number): number {
 }
 
 function beaconFC(city: CityModel): GeoJSON.FeatureCollection {
+  if (city.beacon.height <= 0) return EMPTY_FC
   return {
     type: "FeatureCollection",
     features: [{ type: "Feature", properties: {}, geometry: { type: "Point", coordinates: city.toLngLat(city.beacon.x, city.beacon.y) } }],
@@ -647,22 +648,47 @@ export function CityBlockSimulator() {
     async (lng: number, lat: number, fly = true) => {
       if (!mapRef.current || !loadedRef.current) return
       const seed = seedFromCoords(lng, lat)
+      // Cancel any in-flight OSM request.
+      osmAbortRef.current?.abort()
       if (!uiRef.current.osm) {
         installCity(generateCity({ centerLng: lng, centerLat: lat, blocksX: BLOCKS_X, blocksY: BLOCKS_Y, seed }), lng, lat, fly)
+        setOsmNote(null)
         return
       }
-      // Cancel any in-flight OSM request and fetch fresh real-world data.
-      osmAbortRef.current?.abort()
       const ctrl = new AbortController()
       osmAbortRef.current = ctrl
-      setOsmLoading("Fetching OpenStreetMap buildings & roads…")
+      setOsmLoading("Fetching real road network…")
       setOsmNote(null)
       try {
-        const els = await fetchOSM(lng, lat, uiRef.current.osmRadius, ctrl.signal)
+        // Roads first — small query, so agents start driving real streets
+        // right away. Buildings/greenspace stream in behind the running sim.
+        const roadEls = await fetchOSMRoads(lng, lat, uiRef.current.osmRadius, ctrl.signal)
         if (ctrl.signal.aborted) return
-        const { city, stats } = buildCityFromOSM(lng, lat, seed, els)
+        const { city, stats } = buildCityFromOSM(lng, lat, seed, roadEls)
         installCity(city, lng, lat, fly)
-        setOsmNote(`Real data · ${stats.buildings} buildings · ${stats.roads} roads · ${stats.signals} signals`)
+        setOsmNote(`Real roads · ${stats.roads} streets · ${stats.signals} signals · loading buildings…`)
+        fetchOSMBuildings(lng, lat, uiRef.current.osmRadius, ctrl.signal)
+          .then((els) => {
+            const m = mapRef.current
+            // Drop the result if the user has since moved on to another city.
+            if (ctrl.signal.aborted || cityRef.current !== city || !m) return
+            const ex = buildExtrasFromOSM(lng, lat, seed, els)
+            city.geo.buildings = ex.buildings
+            city.geo.parks = ex.parks
+            city.geo.trees = ex.trees
+            if (ex.beacon.height > 0) city.beacon = ex.beacon
+            const setData = (id: string, data: GeoJSON.FeatureCollection) =>
+              (m.getSource(id) as maplibregl.GeoJSONSource | undefined)?.setData(data)
+            setData("buildings", ex.buildings)
+            setData("parks", ex.parks)
+            setData("trees", ex.trees)
+            setData("beacon", beaconFC(city))
+            setOsmNote(`Real data · ${ex.counts.buildings} buildings · ${stats.roads} streets · ${stats.signals} signals`)
+          })
+          .catch((err) => {
+            if (ctrl.signal.aborted || cityRef.current !== city) return
+            setOsmNote(`Roads are real · buildings unavailable (${err instanceof Error ? err.message : "error"})`)
+          })
       } catch (err) {
         if (ctrl.signal.aborted) return
         // Graceful fallback so the simulator always produces a city.
@@ -675,6 +701,13 @@ export function CityBlockSimulator() {
     },
     [installCity],
   )
+
+  const cancelOsm = useCallback(() => {
+    osmAbortRef.current?.abort()
+    osmAbortRef.current = null
+    setOsmLoading(null)
+    setOsmNote("Fetch cancelled — keeping the current city")
+  }, [])
 
   // Once the map is ready, upgrade the initial procedural placeholder to real
   // OpenStreetMap data for the default location (no camera move).
@@ -907,6 +940,12 @@ export function CityBlockSimulator() {
           <div className="mx-auto mb-2 h-6 w-6 animate-spin rounded-full border-2 border-cyan-400 border-t-transparent" />
           <div className="text-sm font-semibold text-cyan-200">{osmLoading}</div>
           <div className="mt-0.5 text-[11px] text-slate-400">OpenStreetMap · Overpass API</div>
+          <button
+            onClick={cancelOsm}
+            className="pointer-events-auto mt-2 rounded-md border border-slate-600 px-3 py-1 text-[11px] text-slate-300 hover:bg-slate-800"
+          >
+            Cancel
+          </button>
         </div>
       )}
 

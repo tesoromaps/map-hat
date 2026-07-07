@@ -21,9 +21,14 @@ basemaps and driven by real OpenStreetMap geometry:
   by their real heights/levels), the drivable road network, and traffic signals
   from the Overpass API for any location. Agents drive the **real streets**
   (one-way and turn-restricted where tagged), stop at **real signalized
-  intersections**, and the tallest real building gets the rooftop beacon. Falls
-  back to a procedural grid if a location has too little data or Overpass is
-  unavailable. Toggleable, with an adjustable fetch radius.
+  intersections**, and the tallest real building gets the rooftop beacon.
+  Loads progressively — the small road-network query lands first so traffic
+  starts immediately, then buildings/parks/trees stream in. Overpass mirrors
+  are raced with staggered hedged requests and hard 14s per-attempt timeouts
+  (a stalled mirror can never hang the app), results are cached, and a Cancel
+  button aborts mid-fetch. Falls back to a procedural grid if a location has
+  too little data or Overpass is unavailable. Toggleable, with an adjustable
+  fetch radius.
 - **Real basemaps & coordinates** — switch between satellite imagery, streets,
   topographic, dark and light basemaps (all keyless: Esri, OpenStreetMap,
   CARTO), with a live lat/lng/zoom readout and scale bar. The synthetic city
