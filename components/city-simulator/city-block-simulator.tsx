@@ -83,6 +83,24 @@ const DEFAULT_UI: UiState = {
   showStreetlights: true,
 }
 
+// Defined at module level so the panel's 400ms stats re-render doesn't remount
+// every switch (a nested component gets a new identity each render).
+function Toggle({ label, value, onChange }: { label: string; value: boolean; onChange: (v: boolean) => void }) {
+  return (
+    <label className="flex cursor-pointer items-center justify-between gap-2 py-0.5 text-xs text-slate-300">
+      <span>{label}</span>
+      <button
+        type="button"
+        onClick={() => onChange(!value)}
+        className={`relative h-5 w-9 rounded-full transition-colors ${value ? "bg-cyan-500" : "bg-slate-600"}`}
+        aria-pressed={value}
+      >
+        <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition-all ${value ? "left-[18px]" : "left-0.5"}`} />
+      </button>
+    </label>
+  )
+}
+
 function seedFromCoords(lng: number, lat: number): number {
   const n = (Math.floor((lng + 180) * 8192) ^ Math.floor((lat + 90) * 8192)) >>> 0
   return n || 1
@@ -894,20 +912,6 @@ export function CityBlockSimulator() {
 
   const phase = dayPhase(clock.hour)
   const set = <K extends keyof UiState>(key: K, value: UiState[K]) => setUi((prev) => ({ ...prev, [key]: value }))
-
-  const Toggle = ({ label, value, onChange }: { label: string; value: boolean; onChange: (v: boolean) => void }) => (
-    <label className="flex cursor-pointer items-center justify-between gap-2 py-0.5 text-xs text-slate-300">
-      <span>{label}</span>
-      <button
-        type="button"
-        onClick={() => onChange(!value)}
-        className={`relative h-5 w-9 rounded-full transition-colors ${value ? "bg-cyan-500" : "bg-slate-600"}`}
-        aria-pressed={value}
-      >
-        <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition-all ${value ? "left-[18px]" : "left-0.5"}`} />
-      </button>
-    </label>
-  )
 
   return (
     <div
