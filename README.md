@@ -1,36 +1,81 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# map-hat
+
+A [Next.js](https://nextjs.org) mapping playground.
 
 ## Getting Started
 
-First, run the development server:
-
 ```bash
+npm install
 npm run dev
-# ornp
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](  with your browser to see the result.
+Open [http://localhost:3000](http://localhost:3000) for the AI-enhanced map, or
+[http://localhost:3000/simulator](http://localhost:3000/simulator) for the City Block Simulator.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## City Block Simulator (`/simulator`)
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+A traffic-simulation sandbox rendered with MapLibre GL, georeferenced over real
+basemaps and driven by real OpenStreetMap geometry:
 
-## Learn More
+- **Real OpenStreetMap city** — "Build here" fetches actual buildings (extruded
+  by their real heights/levels), the drivable road network, and traffic signals
+  from the Overpass API for any location. Agents drive the **real streets**
+  (one-way and turn-restricted where tagged), stop at **real signalized
+  intersections**, and the tallest real building gets the rooftop beacon.
+  Loads progressively — the small road-network query lands first so traffic
+  starts immediately, then buildings/parks/trees stream in. Overpass mirrors
+  are raced with staggered hedged requests and hard 14s per-attempt timeouts
+  (a stalled mirror can never hang the app), results are cached, and a Cancel
+  button aborts mid-fetch. Falls back to a procedural grid if a location has
+  too little data or Overpass is unavailable. Toggleable, with an adjustable
+  fetch radius.
+- **Real basemaps & coordinates** — switch between satellite imagery, streets,
+  topographic, dark and light basemaps (all keyless: Esri, OpenStreetMap,
+  CARTO), with a live lat/lng/zoom readout and scale bar. The synthetic city
+  renders as a translucent overlay (adjustable ground opacity) on top.
+- **Place search & relocation** — search any place or address (OpenStreetMap
+  Nominatim) and fly there, or "Build here" to regenerate the entire
+  simulation at that coordinate. Rebuild at the current map center too.
+- **Multi-agent traffic** — cars, taxis, buses and trucks navigate a signalized
+  road grid with car-following, stop lines, yellow-light decisions and random
+  turning at intersections. Buses pull up and dwell at curbside bus stops.
+  Click any vehicle to follow it with the camera.
+- **Pedestrians** — sidewalk-walking agents that wait at signalized corners
+  until cross-traffic has the red, with person-class detection boxes.
+- **Live detection overlay** — toggleable CV-style bounding boxes around every
+  vehicle with class, confidence and track ID labels, plus fading track trails.
+- **Census-style tracts** — choropleth tract polygons with synthetic population,
+  density and income data (click a tract for details).
+- **Day → night cycle** — adjustable clock and day length drive a full palette
+  transition; streetlights pop on one by one at dusk, headlights and signal
+  glows appear at night, tall buildings light their windows, and a rooftop
+  beacon blinks on the tallest tower.
+- **Infrastructure animations** — cycling traffic signals at every interior
+  intersection, crosswalks, lane lines, parks with trees, 3D extruded buildings.
+- **Geo data import + animation** — drop or browse for **GeoJSON, KML, KMZ,
+  zipped shapefiles, or loose `.shp` + `.dbf` pairs**; each file becomes a
+  toggleable, removable overlay (rendered above the city so it's always visible)
+  with zoom-to-fit, a properties popup, and "build simulation over this layer".
+  Each layer can be **animated**: flowing marching-ants glow on lines, pulsing
+  points, or live polygon extrusions.
 
-To learn more about Next.js, take a look at the following resources:
+Key code:
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+| Path | Purpose |
+| --- | --- |
+| `app/simulator/page.tsx` | Route (client-only dynamic import) |
+| `components/city-simulator/city-block-simulator.tsx` | Map, render loop, UI panel |
+| `lib/city-simulator/citygen.ts` | Procedural city + shared polyline/bearing geometry helpers |
+| `lib/city-simulator/osm.ts` | OpenStreetMap (Overpass) fetch → real road graph + buildings |
+| `lib/city-simulator/traffic.ts` | Multi-agent traffic engine (polyline edges) + frame builders |
+| `lib/city-simulator/daynight.ts` | Day/night palette keyframes |
+| `lib/city-simulator/geo-import.ts` | Shapefile / KML / KMZ / GeoJSON parsing |
+| `lib/city-simulator/basemaps.ts` | Keyless raster basemap collection |
+| `lib/city-simulator/geocode.ts` | Nominatim place/address search |
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## Build
 
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+```bash
+npm run build
+npm start
+```

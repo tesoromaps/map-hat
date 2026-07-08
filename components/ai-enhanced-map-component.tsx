@@ -106,7 +106,7 @@ export function AiEnhancedMapComponent() {
 
   useEffect(() => {
     if (!mapRef.current) {
-      const fortWorth = [32.7555, -97.3308]
+      const fortWorth: [number, number] = [32.7555, -97.3308]
       mapRef.current = L.map("map").setView(fortWorth, 10)
 
       L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
@@ -362,7 +362,7 @@ export function AiEnhancedMapComponent() {
         })
         const extractedText = result.data.text || ""
         const previewUrl = URL.createObjectURL(file)
-        const initialRecord = {
+        const initialRecord: CRMRecord = {
           ...extractCrmFieldsFromText(extractedText, file.name),
           imageUrl: previewUrl,
           geocodeStatus: extractedText ? "pending" : "none",

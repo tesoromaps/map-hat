@@ -28,17 +28,20 @@
     "react": "^18",
     "react-dom": "^18",
     "shp-write": "^0.3.2",
+    "shpjs": "^6.2.0",
     "tailwind-merge": "^2.5.4",
     "tailwindcss-animate": "^1.0.7",
-    "xmldom": "^0.6.0",
-    "tesseract.js": "^4.1.3"
+    "tesseract.js": "^4.1.3",
+    "xmldom": "^0.6.0"
   },
   "devDependencies": {
+    "@types/leaflet": "^1.9.21",
     "@types/node": "^20",
     "@types/react": "^18",
     "@types/react-dom": "^18",
     "eslint": "^8",
     "eslint-config-next": "14.2.16",
+    "playwright": "^1.61.1",
     "postcss": "^8",
     "tailwindcss": "^3.4.17",
     "typescript": "^5"
